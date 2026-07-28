@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "name": "Xiaomi 14 ProShot",
+  "description": "Profile tuned for Xiaomi 14 files produced by ProShot and the stock camera.",
+  "pair_time_threshold_seconds": 0.8,
+  "bracket_adjacent_threshold_seconds": 1.0,
+  "bracket_duration_seconds": 5.0,
+  "expected_bracket_sizes": [3, 5]
+}

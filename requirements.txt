@@ -1,0 +1,10 @@
+# Runtime dependencies, pinned exactly so a build is reproducible.
+# Verified against Python 3.13.5 on Windows.
+
+# Preview decoding and image dimensions.
+Pillow==12.3.0
+
+# Optional theming. app/theme_manager.py falls back to plain ttk when it is absent,
+# so the application still runs without it.
+# Held at the 1.x line deliberately: 2.0.0 changes the Style API this code uses.
+ttkbootstrap==1.20.4

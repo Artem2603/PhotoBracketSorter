@@ -1,0 +1,7 @@
+# Development and build dependencies, pinned so builds are reproducible.
+-r requirements.txt
+
+pytest==9.1.1
+pyinstaller==6.21.0
+ruff==0.15.22
+black==26.5.1

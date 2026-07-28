@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+build/
+dist/
+*.spec.bak
+Sorted_Photos_*/
+*.partial
+
+# Release artifacts: attached to GitHub Releases, not committed to history.
+*.zip
+PhotoBracketSorter.exe
+SHA256SUMS.txt

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "name": "Generic",
+  "description": "Conservative defaults for cameras with limited metadata.",
+  "pair_time_threshold_seconds": 0.8,
+  "bracket_adjacent_threshold_seconds": 1.2,
+  "bracket_duration_seconds": 6.0
+}
