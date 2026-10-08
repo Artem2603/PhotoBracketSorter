@@ -11,7 +11,7 @@ from app.analysis import analyze_folder
 from app.copy_engine import CopyEngine
 from app.copy_plan import build_copy_plan
 from app.enums import OperationStatus
-from app.models import AppSettings
+from app.models import AppSettings, CopyResult
 from app.move_engine import MoveEngine
 from app.operation_journal import (
     MAX_JOURNAL_ENTRIES,
@@ -47,7 +47,7 @@ def make_source_with_files(tmpdir: Path, count: int = 1) -> Path:
     return source
 
 
-def run_move(tmpdir: Path, count: int = 1) -> tuple[Path, "CopyResult"]:
+def run_move(tmpdir: Path, count: int = 1) -> tuple[Path, CopyResult]:
     source = make_source_with_files(tmpdir, count)
     output = tmpdir / "output"
     output.mkdir(exist_ok=True)

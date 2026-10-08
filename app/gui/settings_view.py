@@ -36,8 +36,9 @@ class SettingsViewMixin:
     def _open_settings(self) -> None:
         dialog = tk.Toplevel(self)
         dialog.title(self.i18n.gettext("action.settings"))
-        dialog.geometry("760x620")
-        dialog.minsize(680, 520)
+        dialog.geometry("860x660")
+        dialog.minsize(720, 540)
+        dialog.transient(self)
         notebook = ttk.Notebook(dialog)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
         variables: dict[str, tk.Variable] = {}
@@ -145,15 +146,21 @@ class SettingsViewMixin:
         ttk.Button(buttons, text=self.i18n.gettext("settings.close"), command=dialog.destroy).pack(side="right")
         ttk.Button(buttons, text=self.i18n.gettext("settings.save"), command=lambda: self._apply_settings_dialog(variables, dialog)).pack(side="right", padx=(0, 8))
 
+    def _settings_label(self, name: str) -> str:
+        """Human-readable label for a settings field; the raw identifier is the fallback."""
+        key = f"settings.field.{name}"
+        text = self.i18n.gettext(key)
+        return name if text == key else text
+
     def _settings_check(self, parent, variables: dict[str, tk.Variable], name: str) -> None:
         var = tk.BooleanVar(value=bool(getattr(self.settings, name)))
         variables[name] = var
-        ttk.Checkbutton(parent, text=name, variable=var).pack(anchor="w", pady=2)
+        ttk.Checkbutton(parent, text=self._settings_label(name), variable=var).pack(anchor="w", pady=3)
 
     def _settings_entry(self, parent, variables: dict[str, tk.Variable], name: str) -> None:
         frame = ttk.Frame(parent)
         frame.pack(fill="x", pady=2)
-        ttk.Label(frame, text=name, width=34).pack(side="left")
+        ttk.Label(frame, text=self._settings_label(name), width=46).pack(side="left")
         value = getattr(self.settings, name)
         if isinstance(value, tuple):
             value = ", ".join(value)
@@ -164,7 +171,7 @@ class SettingsViewMixin:
     def _settings_combo(self, parent, variables: dict[str, tk.Variable], name: str, values: tuple[str, ...]) -> None:
         frame = ttk.Frame(parent)
         frame.pack(fill="x", pady=2)
-        ttk.Label(frame, text=name, width=34).pack(side="left")
+        ttk.Label(frame, text=self._settings_label(name), width=46).pack(side="left")
         value = getattr(self.settings, name)
         if hasattr(value, "value"):
             value = value.value
@@ -203,9 +210,9 @@ class SettingsViewMixin:
             return
         self.i18n.set_language(self.settings.language)
         self.language_var.set(LANGUAGE_LABELS.get(self.settings.language, "English"))
-        self.theme_var.set(self.settings.theme)
         apply_theme(self, self.settings)
         self._refresh_texts()
+        self._apply_theme_colors()
         dialog.destroy()
 
     def _export_settings(self) -> None:
@@ -236,13 +243,18 @@ class SettingsViewMixin:
         body = ttk.Frame(dialog, padding=12)
         body.pack(fill="both", expand=True)
 
+        table = ttk.Frame(body)
+        table.pack(fill="both", expand=True, side="top")
         columns = ("name", "camera")
-        tree = ttk.Treeview(body, columns=columns, show="headings", selectmode="browse")
+        tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse")
         tree.heading("name", text=self.i18n.gettext("profiles.column.name"))
         tree.heading("camera", text=self.i18n.gettext("profiles.column.camera"))
         tree.column("name", width=280, anchor="w")
         tree.column("camera", width=260, anchor="w")
-        tree.pack(fill="both", expand=True, side="top")
+        scroll = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
+        scroll.pack(fill="y", side="right")
+        tree.pack(fill="both", expand=True, side="left")
+        tree.configure(yscrollcommand=scroll.set)
 
         profiles_by_iid: dict[str, CameraProfile] = {}
 

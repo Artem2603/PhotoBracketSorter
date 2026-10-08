@@ -6,9 +6,9 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from app.enums import DestinationCategory, DetectedType
+from app.enums import ConfidenceLevel, DestinationCategory, DetectedType
 from app.errors import ManualSeriesError
-from app.models import AnalysisResult, PhotoFile, PhotoMetadata
+from app.models import AnalysisResult, BracketSeries, PhotoFile, PhotoMetadata
 from app.series_manager import SeriesManager, compute_statistics
 
 BASE_TIME = datetime(2026, 7, 1, 12, 0, 0)
@@ -297,6 +297,153 @@ class RenameSeriesTests(unittest.TestCase):
         self.assertNotIn(":", series.custom_name)
         self.assertNotIn("/", series.custom_name)
         self.assertNotIn("?", series.custom_name)
+
+
+def make_auto_series(files: list[PhotoFile], number: int = 1, companions: dict[str, PhotoFile | None] | None = None) -> BracketSeries:
+    """A detector-shaped automatic series (the detector numbers from 1 on every call)."""
+    return BracketSeries(
+        series_id=f"HDR3_{number:04d}",
+        series_number=number,
+        series_size=3,
+        raw_files=files,
+        rendered_companions=companions if companions is not None else {file.metadata.file_name: None for file in files},
+        start_time=files[0].metadata.capture_time,
+        end_time=files[-1].metadata.capture_time,
+        duration_seconds=0.8,
+        exposure_values=[-1.0, 0.0, 1.0],
+        estimated_step_ev=1.0,
+        confidence=90.0,
+        confidence_level=ConfidenceLevel.HIGH,
+        automatic=True,
+        manually_confirmed=False,
+    )
+
+
+class AutomaticSeriesRegistrationTests(unittest.TestCase):
+    """Regression: a series detected after the initial analysis ("restore
+    automatic" in the review queue) was appended with the detector's own
+    numbering, so two automatic series shared ``HDR3_0001`` and the
+    ``BRACKETING_3/Series_0001`` destination folder."""
+
+    def test_add_automatic_assigns_the_next_free_number_and_folder(self):
+        first = [make_file(index) for index in range(3)]
+        second = [make_file(index) for index in range(10, 13)]
+        manager = SeriesManager([make_auto_series(first)])
+        manager.sync_destinations()
+        added = manager.add_automatic(make_auto_series(second))  # detector-numbered HDR3_0001 again
+        ids = [series.series_id for series in manager.series]
+        roots = [series.destination_root for series in manager.series]
+        self.assertEqual(len(set(ids)), 2, ids)
+        self.assertEqual(len(set(roots)), 2, roots)
+        self.assertEqual(added.series_id, "HDR3_0002")
+        self.assertEqual(added.destination_root, Path("BRACKETING_3/Series_0002"))
+        self.assertTrue(added.automatic)
+        for file in second:
+            self.assertEqual(file.series_id, "HDR3_0002")
+            self.assertEqual(file.destination_subpath, Path("BRACKETING_3/Series_0002/RAW") / file.metadata.file_name)
+
+    def test_add_automatic_never_reuses_a_number_freed_by_dissolve(self):
+        manager = SeriesManager(
+            [
+                make_auto_series([make_file(index) for index in range(3)], 1),
+                make_auto_series([make_file(index) for index in range(10, 13)], 2),
+            ]
+        )
+        manager.dissolve(manager.series[1])
+        added = manager.add_automatic(make_auto_series([make_file(index) for index in range(20, 23)]))
+        self.assertEqual(added.series_id, "HDR3_0003")
+
+    def test_add_automatic_is_idempotent_for_a_series_already_registered(self):
+        manager = SeriesManager()
+        series = manager.add_automatic(make_auto_series([make_file(index) for index in range(3)]))
+        again = manager.add_automatic(series)
+        self.assertIs(again, series)
+        self.assertEqual(len(manager.series), 1)
+        self.assertEqual(series.series_id, "HDR3_0001")
+
+    def test_add_automatic_selects_its_own_members(self):
+        files = [make_file(index) for index in range(3)]
+        files[1].selected = False
+        SeriesManager().add_automatic(make_auto_series(files))
+        self.assertTrue(all(file.selected for file in files))
+
+
+class SelectionSurvivesSyncTests(unittest.TestCase):
+    """Regression: ``sync_destinations`` set ``selected=True`` on every member, so a
+    frame the user unticked was silently re-selected by any later series operation."""
+
+    def test_deselected_frame_survives_an_unrelated_series_creation(self):
+        manager = SeriesManager()
+        frames = [make_file(index) for index in range(3)]
+        manager.create_manual(frames, 3)
+        frames[0].selected = False
+        manager.create_manual([make_file(index) for index in range(10, 13)], 3)
+        self.assertFalse(frames[0].selected)
+
+    def test_deselected_frame_survives_rename_dissolve_and_explicit_sync(self):
+        manager = SeriesManager()
+        frames = [make_file(index) for index in range(3)]
+        manager.create_manual(frames, 3)
+        other = manager.create_manual([make_file(index) for index in range(10, 13)], 3)
+        frames[1].selected = False
+        manager.rename_series(other, "Sunset")
+        manager.dissolve(other)
+        manager.sync_destinations()
+        self.assertFalse(frames[1].selected)
+
+    def test_deselected_companion_survives_a_sync(self):
+        raws = [make_file(index) for index in range(3)]
+        heic = make_file(0, DetectedType.HEIC, ".heic")
+        heic.selected = False
+        manager = SeriesManager([make_auto_series(raws, companions={raws[0].metadata.file_name: heic})])
+        manager.sync_destinations()
+        self.assertFalse(heic.selected)
+
+    def test_creating_a_manual_series_still_selects_its_own_members(self):
+        manager = SeriesManager()
+        frames = [make_file(index) for index in range(3)]
+        frames[2].selected = False
+        manager.create_manual(frames, 3)
+        self.assertTrue(all(file.selected for file in frames))
+
+
+class CompanionPlacementFlagTests(unittest.TestCase):
+    """``store_companions_inside_series`` is honoured in exactly one place: here."""
+
+    def _series_with_companion(self) -> tuple[list[PhotoFile], PhotoFile, BracketSeries]:
+        raws = [make_file(index) for index in range(3)]
+        heic = make_file(0, DetectedType.HEIC, ".heic")
+        heic.destination_category = DestinationCategory.HEIC
+        heic.destination_subpath = Path("HEIC") / heic.metadata.file_name
+        raws[0].pair_id = heic.pair_id = "PAIR_0001"
+        series = make_auto_series(raws, companions={raws[0].metadata.file_name: heic, raws[1].metadata.file_name: None, raws[2].metadata.file_name: None})
+        return raws, heic, series
+
+    def test_companions_follow_the_series_by_default(self):
+        _raws, heic, series = self._series_with_companion()
+        SeriesManager([series]).sync_destinations()
+        self.assertEqual(heic.series_id, series.series_id)
+        self.assertIs(heic.destination_category, DestinationCategory.BRACKETING_3)
+        self.assertEqual(heic.destination_subpath, series.destination_root / "HEIC" / heic.metadata.file_name)
+
+    def test_companions_stay_in_heic_when_the_flag_is_off(self):
+        raws, heic, series = self._series_with_companion()
+        SeriesManager([series], store_companions_inside_series=False).sync_destinations()
+        self.assertIsNone(heic.series_id)
+        self.assertIs(heic.destination_category, DestinationCategory.HEIC)
+        self.assertEqual(heic.destination_subpath, Path("HEIC") / heic.metadata.file_name)
+        # The relation is kept: the RAW is still placed, still paired, and the
+        # series still knows which rendered file belongs to which frame.
+        self.assertEqual(raws[0].series_id, "HDR3_0001")
+        self.assertEqual(heic.pair_id, "PAIR_0001")
+        self.assertIs(series.rendered_companions[raws[0].metadata.file_name], heic)
+
+    def test_from_analysis_reads_the_flag_from_the_settings_snapshot(self):
+        analysis = make_analysis([make_file(index) for index in range(3)])
+        analysis.settings_snapshot = {"store_companions_inside_series": False}
+        self.assertFalse(SeriesManager.from_analysis(analysis).store_companions_inside_series)
+        analysis.settings_snapshot = {}
+        self.assertTrue(SeriesManager.from_analysis(analysis).store_companions_inside_series)
 
 
 if __name__ == "__main__":

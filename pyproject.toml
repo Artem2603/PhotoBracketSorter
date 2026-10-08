@@ -1,6 +1,6 @@
 [project]
 name = "photo-bracket-sorter"
-version = "1.1.1"
+version = "1.2.1"
 description = "Safe Windows desktop sorter for smartphone RAW, HEIC, JPEG, and bracketed photo sets."
 requires-python = ">=3.12"
 dependencies = [

@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from bisect import bisect_left, bisect_right
-from datetime import datetime
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
 
 from app.format_detection import is_raw_type, is_rendered_type
@@ -211,51 +211,110 @@ class PairMatcher:
 
 
 class _RenderedIndex:
-    """Time-ordered index over rendered files, for windowed candidate lookup."""
+    """Time-ordered index over rendered files, for windowed candidate lookup.
+
+    The index mirrors exactly what ``safe_datetime_difference_seconds`` compares,
+    so that it never depends on the machine timezone:
+
+    * naive vs naive compares wall-clock values;
+    * aware vs aware compares true instants (UTC);
+    * aware vs naive borrows the aware side's offset for the naive side, which is
+      again a wall-clock comparison.
+
+    Naive rendered files are therefore keyed by wall-clock seconds, aware ones by
+    both their UTC and their wall-clock seconds, and each RAW is looked up against
+    the key kind that applies to it. Reading naive values through a naive
+    ``timestamp()`` (the PC's timezone) made a naive DNG at 12:00 and an aware HEIC
+    at 12:00+09:00 meet only when the PC itself was on +09:00.
+    """
 
     def __init__(self, rendered_files: list[PhotoFile], settings: AppSettings, threshold: float):
         self.window = max(settings.max_pair_delta_seconds * TIME_WINDOW_FACTOR, 0.0)
         # Only a threshold at or below the no-time ceiling can accept a pair that the
         # time window would exclude, so only then is the exhaustive scan needed.
         self.exhaustive = threshold <= MAX_SCORE_WITHOUT_TIME
-        self._timed: list[tuple[float, int]] = []
+        naive: list[tuple[float, int]] = []
+        aware_utc: list[tuple[float, int]] = []
+        aware_wall: list[tuple[float, int]] = []
         self._untimed: list[int] = []
         for index, file in enumerate(rendered_files):
             if not is_rendered_type(file.metadata.detected_type):
                 continue
-            stamp = _epoch_seconds(file.metadata.capture_time)
-            if stamp is None:
+            value = file.metadata.capture_time
+            wall = _epoch_seconds(value)
+            if wall is None or value is None:
                 self._untimed.append(index)
-            else:
-                self._timed.append((stamp, index))
-        self._timed.sort()
-        self._keys = [stamp for stamp, _index in self._timed]
-        self._all = [index for _stamp, index in self._timed] + self._untimed
+                continue
+            if not is_aware(value):
+                naive.append((wall, index))
+                continue
+            utc = _utc_seconds(value)
+            if utc is None:
+                self._untimed.append(index)
+                continue
+            aware_utc.append((utc, index))
+            aware_wall.append((wall, index))
+        self._naive = _SortedKeys(naive)
+        self._aware_utc = _SortedKeys(aware_utc)
+        self._aware_wall = _SortedKeys(aware_wall)
+        self._all = [index for _stamp, index in sorted(naive + aware_wall)] + self._untimed
 
     def candidates_for(self, raw_file: PhotoFile) -> list[int]:
         if self.exhaustive:
             return self._all
-        stamp = _epoch_seconds(raw_file.metadata.capture_time)
-        if stamp is None:
+        value = raw_file.metadata.capture_time
+        wall = _epoch_seconds(value)
+        if wall is None or value is None:
             # Without a timestamp the RAW can only match on non-time evidence, which
             # cannot clear the threshold on its own.
             return self._untimed
-        low = bisect_left(self._keys, stamp - self.window)
-        high = bisect_right(self._keys, stamp + self.window)
-        return [index for _stamp, index in self._timed[low:high]] + self._untimed
+        if is_aware(value):
+            utc = _utc_seconds(value)
+            if utc is None:
+                return self._untimed
+            found = self._aware_utc.within(utc, self.window) + self._naive.within(wall, self.window)
+        else:
+            found = self._naive.within(wall, self.window) + self._aware_wall.within(wall, self.window)
+        return found + self._untimed
+
+
+class _SortedKeys:
+    """Sorted ``(seconds, index)`` pairs answering "which indices lie within a window"."""
+
+    __slots__ = ("_entries", "_keys")
+
+    def __init__(self, entries: list[tuple[float, int]]):
+        self._entries = sorted(entries)
+        self._keys = [stamp for stamp, _index in self._entries]
+
+    def within(self, stamp: float, window: float) -> list[int]:
+        low = bisect_left(self._keys, stamp - window)
+        high = bisect_right(self._keys, stamp + window)
+        return [index for _stamp, index in self._entries[low:high]]
 
 
 def _epoch_seconds(value: datetime | None) -> float | None:
-    """Comparable seconds for indexing. Naive values are read as wall-clock.
+    """Wall-clock seconds of ``value``; its UTC offset, if any, is ignored.
 
-    Only used to pick candidates; the actual delta always goes through
-    ``safe_file_time_difference_seconds``, which handles mixed awareness properly.
+    Computed arithmetically against the UTC epoch, never through the naive
+    ``timestamp()`` path: that one applies the machine timezone and, on Windows,
+    raises ``OSError`` for anything before 1970. Only used to pick candidates; the
+    actual delta always goes through ``safe_file_time_difference_seconds``.
     """
     if value is None:
         return None
-    if is_aware(value):
+    try:
+        return value.replace(tzinfo=UTC).timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _utc_seconds(value: datetime) -> float | None:
+    """True UTC seconds of an aware value, or ``None`` when they cannot be computed."""
+    try:
         return value.timestamp()
-    return value.replace(tzinfo=None).timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def split_raw_and_rendered(files: list[PhotoFile]) -> tuple[list[PhotoFile], list[PhotoFile]]:

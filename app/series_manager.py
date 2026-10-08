@@ -46,9 +46,14 @@ def category_for_size(size: int) -> DestinationCategory:
 class SeriesManager:
     """Owns all bracket series for one analysis and keeps files consistent."""
 
-    def __init__(self, series: list[BracketSeries] | None = None):
+    def __init__(self, series: list[BracketSeries] | None = None, store_companions_inside_series: bool = True):
         self._series: list[BracketSeries] = list(series or [])
         self._counters: dict[tuple[str, int], int] = {}
+        #: Mirrors ``AppSettings.store_companions_inside_series``. When False a
+        #: series still *knows* its HEIC/JPEG companions (``rendered_companions``
+        #: and the pair relation are kept), but they keep their plain ``HEIC/``
+        #: placement instead of being moved into the series folder.
+        self.store_companions_inside_series = store_companions_inside_series
         self._seed_counters()
 
     # ------------------------------------------------------------------ state
@@ -58,8 +63,12 @@ class SeriesManager:
         return self._series
 
     @classmethod
-    def from_analysis(cls, analysis: AnalysisResult) -> "SeriesManager":
-        return cls(analysis.bracket_series)
+    def from_analysis(cls, analysis: AnalysisResult) -> SeriesManager:
+        # The analysis remembers the settings it was produced with, so a manager
+        # rebuilt later (GUI, session restore) lays companions out the same way
+        # the original classification did.
+        snapshot = analysis.settings_snapshot or {}
+        return cls(analysis.bracket_series, store_companions_inside_series=bool(snapshot.get("store_companions_inside_series", True)))
 
     def apply_to(self, analysis: AnalysisResult) -> None:
         """Publish current series and statistics back onto the analysis result."""
@@ -109,6 +118,30 @@ class SeriesManager:
         )
         self._resolve_exposure(series)
         self._series.append(series)
+        # The user asserted this grouping, so every member is in the plan. This is
+        # an explicit creation-time decision; sync_destinations never touches it.
+        for file in ordered:
+            file.selected = True
+        self.sync_destinations()
+        return series
+
+    def add_automatic(self, series: BracketSeries) -> BracketSeries:
+        """Register a series the real detector produced *after* the initial analysis.
+
+        ``BracketDetector.detect`` numbers its output from 1 on every call, so a
+        series detected later (e.g. "restore automatic decision" in the review
+        queue) would collide with an existing ``HDR3_0001`` — same ``series_id``,
+        same ``Series_0001`` destination folder. The manager owns numbering, so
+        it hands out the next free automatic number here, exactly as
+        :meth:`create_manual` does for manual series.
+        """
+        if series in self._series:
+            self.sync_destinations()
+            return series
+        series.series_id, series.series_number = self._next_id("AUTO", series.series_size)
+        self._series.append(series)
+        for file in series.raw_files:
+            file.selected = True
         self.sync_destinations()
         return series
 
@@ -176,7 +209,14 @@ class SeriesManager:
     # ------------------------------------------------------------ destinations
 
     def sync_destinations(self) -> None:
-        """Rewrite destination paths for every series member from scratch."""
+        """Rewrite destination paths for every series member from scratch.
+
+        Idempotent and called after *every* series operation, so it must not
+        carry side effects beyond placement: in particular it never touches
+        ``PhotoFile.selected`` — a frame the user unticked stays unticked when an
+        unrelated series is created, renamed, or dissolved. Selection is set
+        only where a series is explicitly created or confirmed.
+        """
         for series in self._series:
             category = category_for_size(series.series_size)
             folder = self._folder_name(series)
@@ -191,14 +231,16 @@ class SeriesManager:
                     raw_file.confidence_level = ConfidenceLevel.HIGH
                     if "MANUAL_SERIES" not in raw_file.decision_reasons:
                         raw_file.decision_reasons.append("MANUAL_SERIES")
-                raw_file.selected = True
+            if not self.store_companions_inside_series:
+                # The pair relation (pair_id, rendered_companions) is kept; the
+                # companion simply keeps its plain HEIC/ placement and no series_id.
+                continue
             for companion in series.rendered_companions.values():
                 if companion is None:
                     continue
                 companion.series_id = series.series_id
                 companion.destination_category = category
                 companion.destination_subpath = root / "HEIC" / companion.metadata.file_name
-                companion.selected = True
 
     # --------------------------------------------------------------- internals
 

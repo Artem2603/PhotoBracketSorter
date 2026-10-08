@@ -19,6 +19,7 @@ from app.gui.gui_constants import LANGUAGE_LABELS
 from app.models import AnalysisResult, AppSettings
 from app.series_manager import SeriesManager
 from app.session import SESSION_FILE_EXTENSION, SessionData, build_session, load_session, restore_session, save_session
+from app.settings import merge_session_settings
 from app.theme_manager import apply_theme
 from app.version import APP_NAME, __version__
 
@@ -73,15 +74,16 @@ class DialogsMixin:
     def _on_session_ready(
         self, analysis: AnalysisResult, manager: SeriesManager, settings: AppSettings, session: SessionData, warnings: list[str]
     ) -> None:
-        # The restored settings drive this analysis's classification; they are
-        # applied in memory only, exactly like every other in-app settings
-        # change, and are not written to settings.json until the user does
-        # that explicitly through the Settings dialog.
-        self.settings = settings
+        # The session's analysis settings (thresholds, pairing, output layout)
+        # drive this analysis and are kept like any other in-app settings
+        # change. Machine and UI preferences (language, theme, window, paths,
+        # exiftool_path, log level) stay as they are on this computer — a
+        # session saved elsewhere must not re-skin or re-path this install.
+        self.settings = merge_session_settings(self.settings, settings)
         self.i18n.set_language(self.settings.language)
         self.language_var.set(LANGUAGE_LABELS.get(self.settings.language, "English"))
-        self.theme_var.set(self.settings.theme)
         apply_theme(self, self.settings)
+        self._apply_theme_colors()
         self.analysis = analysis
         self.series_manager = manager
         self.copy_plan = None
@@ -102,6 +104,9 @@ class DialogsMixin:
             messagebox.showwarning(APP_NAME, "\n".join(warnings))
 
     def _show_help(self) -> None:
+        from app.logging_setup import default_log_path
+
         messagebox.showinfo(
-            APP_NAME, f"{APP_NAME} {__version__}\n\nCopy keeps originals. Move deletes originals only after size and SHA-256 verification."
+            self.i18n.gettext("help.title"),
+            self.i18n.gettext("help.body", app=self.i18n.gettext("app.title"), version=__version__, log=str(default_log_path())),
         )

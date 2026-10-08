@@ -48,11 +48,16 @@ def analyze_folder(
     def metadata_progress(done: int, total: int) -> None:
         _phase(progress, "Чтение метаданных", done, total)
 
+    def exif_progress(done: int, total: int) -> None:
+        _phase(progress, "Чтение EXIF", done, total)
+
     if metadata_cache:
         reused, fresh_paths = split_cached_paths(paths, source, metadata_cache)
     else:
         reused, fresh_paths = {}, paths
-    fresh_items = reader.read_many(fresh_paths, source, cancel_event, metadata_progress, settings) if fresh_paths else []
+    fresh_items = (
+        reader.read_many(fresh_paths, source, cancel_event, metadata_progress, settings, exif_progress=exif_progress) if fresh_paths else []
+    )
     metadata_items = merge_metadata(paths, reused, fresh_items)
     if cancel_event.is_set():
         raise AnalysisCancelled()

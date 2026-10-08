@@ -28,6 +28,11 @@ HASH_HEIGHT = 8
 HASH_WIDTH = 9
 HASH_BITS = HASH_HEIGHT * (HASH_WIDTH - 1)
 
+#: Greyscale modes deeper than 8 bits (16-bit TIFF/PNG open this way). Pillow's
+#: ``convert("L")`` clips them to white instead of rescaling, so an 8-bit and a
+#: 16-bit copy of the same picture hashed differently.
+_DEEP_GREYSCALE_MODES = frozenset({"I", "I;16", "I;16B", "I;16L", "I;16N"})
+
 
 def dhash(path: Path) -> int | None:
     """Compute a 64-bit difference hash, or ``None`` if the file cannot be decoded."""
@@ -51,7 +56,7 @@ def dhash_from_image(image) -> int | None:
     if Image is None or image is None:
         return None
     try:
-        reduced = image.convert("L").resize((HASH_WIDTH, HASH_HEIGHT), Image.Resampling.LANCZOS)
+        reduced = _to_greyscale(image).resize((HASH_WIDTH, HASH_HEIGHT), Image.Resampling.LANCZOS)
         pixels = list(reduced.getdata())
     except Exception:
         return None
@@ -63,6 +68,20 @@ def dhash_from_image(image) -> int | None:
             if pixels[offset + column] > pixels[offset + column + 1]:
                 bits |= 1
     return bits
+
+
+def _to_greyscale(image):
+    """``image.convert("L")`` that scales deep greyscale data instead of clipping it."""
+    if image.mode not in _DEEP_GREYSCALE_MODES:
+        return image.convert("L")
+    deep = image if image.mode == "I" else image.convert("I")
+    _low, high = deep.getextrema()
+    if high <= 255:
+        # 8-bit data that merely sits in a wide container.
+        return deep.convert("L")
+    scale = 1.0 / 256.0 if high <= 65535 else 255.0 / high
+    # On mode "I" Pillow accepts only an affine function here and runs it in C.
+    return deep.point(lambda value: value * scale).convert("L")
 
 
 def hash_similarity(left: int | None, right: int | None) -> float | None:

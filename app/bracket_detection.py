@@ -15,6 +15,12 @@ from app.time_compare import (
     time_sort_key,
 )
 
+#: Confidence ceiling for a candidate that failed a hard gate (loose timing,
+#: unusable exposure data, exposure span below the bracket threshold). It sits
+#: below every built-in acceptance threshold, so the candidate stays visible to
+#: the review queue as a near miss but is never accepted as an automatic series.
+HARD_GATE_CONFIDENCE_CAP = 44.0
+
 
 class BracketDetector:
     def detect(self, raw_files: list[PhotoFile], settings: AppSettings) -> tuple[list[BracketCandidate], list[BracketSeries]]:
@@ -139,7 +145,7 @@ class BracketDetector:
                     exposure_source="UNKNOWN",
                     estimated_step_ev=None,
                     score=score,
-                    confidence=min(score, 44.0),
+                    confidence=min(score, HARD_GATE_CONFIDENCE_CAP),
                     reasons=reasons,
                     warnings=warnings,
                     score_breakdown=breakdown,
@@ -150,6 +156,7 @@ class BracketDetector:
         values = list(group.values)
         source = group.source.value
         estimated_step = group.step_ev
+        span_below_threshold = False
         if group.usable:
             reasons.append(f"BRACKET_EXPOSURE_SOURCE_{group.source.value.upper()}")
             for skipped_source, skip_reason in group.skipped_sources:
@@ -159,7 +166,12 @@ class BracketDetector:
                 reasons.append("BRACKET_EXPOSURE_SPAN_OK")
                 breakdown.append(("BRACKET_EXPOSURE_SPAN_OK", 25.0))
             else:
+                # A hard gate, not a forfeited bonus. An auto-exposure burst whose
+                # shutter or ISO drifts a little (1/125, 1/140, 1/160) still has a
+                # "uniform step", matching dimensions and one lens, and those points
+                # alone carried it past the threshold as a phantom HDR series.
                 warnings.append("Разброс экспозиции меньше порога вилки.")
+                span_below_threshold = True
             if group.uniform:
                 score += 20.0
                 reasons.append("BRACKET_EXPOSURE_STEP_OK")
@@ -181,7 +193,7 @@ class BracketDetector:
                 exposure_source=source,
                 estimated_step_ev=None,
                 score=score,
-                confidence=min(score, 44.0),
+                confidence=min(score, HARD_GATE_CONFIDENCE_CAP),
                 reasons=reasons,
                 warnings=warnings,
                 score_breakdown=breakdown,
@@ -195,6 +207,8 @@ class BracketDetector:
             reasons.append("BRACKET_LENS_OK")
             breakdown.append(("BRACKET_LENS_OK", 5.0))
         confidence = min(100.0, score)
+        if span_below_threshold:
+            confidence = min(confidence, HARD_GATE_CONFIDENCE_CAP)
         if confidence < _series_threshold(settings):
             warnings.append("Группа похожа на обычную серийную съёмку.")
         return BracketCandidate(

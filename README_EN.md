@@ -1,4 +1,4 @@
-# Photo Bracket Sorter 1.1.0
+# Photo Bracket Sorter 1.2.1
 
 Portable Windows app for sorting HEIC/JPEG, RAW/DNG, and 3/5-frame bracketed photo folders.
 

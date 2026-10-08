@@ -241,7 +241,14 @@ class CopyResult:
 
     @property
     def processed_files(self) -> int:
-        return sum(1 for operation in self.operations if operation.status is not OperationStatus.PENDING)
+        """Operations that were actually attempted.
+
+        SKIPPED marks work that was never started (everything after a cancel),
+        so it must not count as processed — a run cancelled after one file
+        used to report "4 of 4 processed".
+        """
+        attempted = {OperationStatus.COMPLETED, OperationStatus.ERROR, OperationStatus.DELETE_FAILED, OperationStatus.CANCELLED}
+        return sum(1 for operation in self.operations if operation.status in attempted)
 
 
 @dataclass(slots=True)

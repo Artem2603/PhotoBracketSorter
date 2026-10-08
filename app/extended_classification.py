@@ -243,12 +243,56 @@ def _focus_distance_spread_ratio(cluster: list[PhotoFile]) -> float | None:
     return max(distances) / min(distances)
 
 
-def _average_adjacent_similarity(cluster: list[PhotoFile], exiftool: ExifToolRunner) -> float | None:
-    from app.series_preview import extract_preview_image
+#: Frames sampled per cluster for the visual check. Adjacent-frame similarity
+#: over an evenly spaced sample is enough to tell a burst from a panorama;
+#: hashing all 60 frames of a long burst only costs time.
+VISUAL_SAMPLE_LIMIT = 6
+#: Longest edge used for perceptual hashing; dhash downsamples to 9x8 anyway.
+_HASH_PREVIEW_SIZE = 256
 
+
+def _sample_evenly(cluster: list[PhotoFile], limit: int = VISUAL_SAMPLE_LIMIT) -> list[PhotoFile]:
+    if len(cluster) <= limit:
+        return list(cluster)
+    step = (len(cluster) - 1) / (limit - 1)
+    return [cluster[round(index * step)] for index in range(limit)]
+
+
+def _average_adjacent_similarity(cluster: list[PhotoFile], exiftool: ExifToolRunner) -> float | None:
+    """Mean dhash similarity of neighbouring frames in an evenly spaced sample.
+
+    All RAW previews of the sample are extracted with a single ExifTool call
+    (previously up to three processes per frame, for every frame of every
+    burst, during analysis).
+    """
+    import io
+
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - Pillow is a pinned runtime dependency
+        return None
+
+    sample = _sample_evenly(cluster)
+    raw_paths = [file.metadata.source_path for file in sample if is_raw_type(file.metadata.detected_type)]
+    embedded = exiftool.extract_embedded_previews(raw_paths) if raw_paths else {}
     hashes: list[int | None] = []
-    for file in cluster:
-        image, _source, _error = extract_preview_image(file.metadata.source_path, exiftool, is_raw_type(file.metadata.detected_type))
+    for file in sample:
+        path = file.metadata.source_path
+        image = None
+        try:
+            if is_raw_type(file.metadata.detected_type):
+                payload = embedded.get(path.resolve())
+                if payload is not None:
+                    image = Image.open(io.BytesIO(payload[0]))
+                    image.load()
+            else:
+                with Image.open(path) as opened:
+                    opened.load()
+                    image = opened.copy()
+            if image is not None:
+                image.thumbnail((_HASH_PREVIEW_SIZE, _HASH_PREVIEW_SIZE))
+        except Exception:
+            image = None
         hashes.append(dhash_from_image(image) if image is not None else None)
     similarities = [hash_similarity(hashes[index], hashes[index + 1]) for index in range(len(hashes) - 1)]
     valid = [value for value in similarities if value is not None]

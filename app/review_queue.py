@@ -21,7 +21,6 @@ from enum import Enum
 from typing import Iterable
 
 from app.enums import DestinationCategory
-from app.errors import ManualSeriesError
 from app.exposure import priority_from_names, resolve_group_exposure
 from app.manual_overrides import assign_category
 from app.models import AnalysisResult, AppSettings, BracketCandidate, BracketSeries, PhotoFile
@@ -41,6 +40,18 @@ SPLIT_KEEP_SINGLE_MARKER = "REVIEW_SPLIT_KEEP_SINGLE"
 
 _MIXED_TIME_WARNING_CODES = ("MIXED_TIMEZONE_ASSUMED_OFFSET", "TIME_COMPARISON_UNAVAILABLE")
 _WEAK_TIME_SOURCES = ("FILE_NAME", "FILE_MTIME", "UNKNOWN")
+
+#: A near-miss candidate below this confidence is only shown when its frames
+#: carry real exposure variation. 45 is the ``ConfidenceLevel.LOW`` boundary:
+#: anything under it is what the detector itself calls REVIEW-grade noise, and
+#: a plain burst produces one such window per sliding position (34 of them for
+#: a 20-frame burst), which is a flood, not a queue.
+NEAR_MISS_MIN_CONFIDENCE = 45.0
+
+#: The note ``app.pairing.PairMatcher`` writes on both files of an ambiguous
+#: RAW/rendered match it declined to pair. Matched by substring because the
+#: matcher records it as free text, not a code.
+_AMBIGUOUS_PAIR_WARNING_FRAGMENT = "неоднозначен"
 
 
 class ReviewReason(str, Enum):
@@ -80,7 +91,7 @@ def build_review_queue(
     """Rebuild the queue from current, live state. Never mutates anything."""
     items: list[ReviewItem] = []
     items.extend(_series_items(manager, settings, language))
-    items.extend(_near_miss_candidate_items(analysis, language))
+    items.extend(_near_miss_candidate_items(analysis, settings, language))
     items.extend(_ambiguous_pair_items(analysis, language))
     items.extend(_name_conflict_items(analysis, language))
     items.extend(_manual_file_override_items(analysis, language))
@@ -203,18 +214,43 @@ def _has_weak_time_source(series: BracketSeries) -> bool:
 # ------------------------------------------------------------- near-miss candidates
 
 
-def _near_miss_candidate_items(analysis: AnalysisResult, language: str) -> list[ReviewItem]:
-    items: list[ReviewItem] = []
-    seen_candidate_file_sets: set[frozenset[int]] = set()
-    for candidate in analysis.bracket_candidates:
+def _near_miss_candidate_items(analysis: AnalysisResult, settings: AppSettings, language: str) -> list[ReviewItem]:
+    """One item per *distinct* group worth a look, not one per sliding window.
+
+    The detector scores every 3- and 5-frame window, so a burst of N frames
+    yields roughly 2N overlapping candidates. Windows that are plainly noise
+    (REVIEW-grade confidence with no exposure variation) are dropped, files
+    the user already dealt with (excluded, manually categorised, confirmed,
+    dismissed) are skipped, and of the windows that remain only the strongest
+    non-overlapping ones are listed — confirming one of them resolves the
+    overlapping ones anyway, so showing them all is pure duplication.
+    """
+    eligible: list[tuple[int, BracketCandidate]] = []
+    for position, candidate in enumerate(analysis.bracket_candidates):
         if any(file.series_id is not None for file in candidate.files):
             continue  # already resolved into a series (this window, or an overlapping one, was accepted)
         if any(DISMISS_NOT_BRACKET_MARKER in file.decision_reasons for file in candidate.files):
             continue  # the user already looked at this exact group and said no
-        key = frozenset(id(file) for file in candidate.files)
-        if key in seen_candidate_file_sets:
+        if any(_user_resolved(file) for file in candidate.files):
+            continue  # "Исключить" or a manual category already settled at least one frame
+        if candidate.confidence < NEAR_MISS_MIN_CONFIDENCE and not _has_exposure_evidence(candidate, settings):
+            continue  # a burst window, not a bracket that narrowly missed
+        eligible.append((position, candidate))
+
+    # Strongest first; among equals, the larger window, then detector order.
+    eligible.sort(key=lambda entry: (-entry[1].confidence, -entry[1].candidate_size, entry[0]))
+    claimed: set[int] = set()
+    chosen: list[tuple[int, BracketCandidate]] = []
+    for position, candidate in eligible:
+        ids = {id(file) for file in candidate.files}
+        if ids & claimed:
             continue
-        seen_candidate_file_sets.add(key)
+        claimed |= ids
+        chosen.append((position, candidate))
+    chosen.sort(key=lambda entry: entry[0])
+
+    items: list[ReviewItem] = []
+    for _position, candidate in chosen:
         items.append(
             ReviewItem(
                 item_id=f"near_miss:{candidate.candidate_id}",
@@ -229,13 +265,32 @@ def _near_miss_candidate_items(analysis: AnalysisResult, language: str) -> list[
     return items
 
 
+def _has_exposure_evidence(candidate: BracketCandidate, settings: AppSettings) -> bool:
+    """True when the window's frames really vary in exposure like a bracket.
+
+    The detector stops scoring early on timing failures, so a genuine bracket
+    shot a little too slowly carries no exposure data on the candidate itself;
+    the frames are therefore re-read with the same resolver and settings the
+    detector uses, not a second rule.
+    """
+    if "BRACKET_EXPOSURE_SPAN_OK" in candidate.reasons:
+        return True
+    group = resolve_group_exposure(candidate.files, settings.exposure_step_tolerance, priority_from_names(settings.exposure_source_priority))
+    return group.usable and group.span is not None and group.span >= settings.min_exposure_span_ev
+
+
+def _user_resolved(file: PhotoFile) -> bool:
+    """The user already decided this file's fate; the queue must not re-ask."""
+    return file.destination_category is DestinationCategory.SKIP or file.manual_override is not None
+
+
 # --------------------------------------------------------------- ambiguous pairs
 
 
 def _ambiguous_pair_items(analysis: AnalysisResult, language: str) -> list[ReviewItem]:
     items: list[ReviewItem] = []
     for pair in analysis.pairs:
-        if pair.ambiguous:
+        if pair.ambiguous and not (_user_resolved(pair.raw_file) or _user_resolved(pair.rendered_file)):
             items.append(
                 ReviewItem(
                     item_id=f"ambiguous_pair:{pair.pair_id}",
@@ -249,7 +304,9 @@ def _ambiguous_pair_items(analysis: AnalysisResult, language: str) -> list[Revie
     for file in analysis.files:
         if id(file) in seen_files:
             continue
-        if any("неоднозначен" in warning for warning in file.warnings) and file.pair_id is None:
+        if _user_resolved(file):
+            continue  # excluded or manually categorised: the ambiguity no longer needs an answer
+        if any(_AMBIGUOUS_PAIR_WARNING_FRAGMENT in warning for warning in file.warnings) and file.pair_id is None:
             seen_files.add(id(file))
             items.append(
                 ReviewItem(
@@ -390,10 +447,10 @@ def restore_automatic(manager: SeriesManager, series: BracketSeries, settings: A
     if not detected:
         _mark_split_keep_single(files)
         return None
-    new_series = detected[0]
-    manager.series.append(new_series)
-    manager.sync_destinations()
-    return new_series
+    # The detector numbers from 1 on every call; the manager hands out the next
+    # free automatic number so the restored series never shares an id or a
+    # destination folder with one that already exists.
+    return manager.add_automatic(detected[0])
 
 
 def _mark_split_keep_single(files: Iterable[PhotoFile]) -> None:

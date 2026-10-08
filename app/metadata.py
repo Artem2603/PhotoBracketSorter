@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any, Callable
 
 from app.capture_time import extract_capture_time
 from app.enums import DetectedType
+from app.errors import ExifToolError, ExifToolTimeoutError
 from app.exiftool_runner import ExifToolRunner
 from app.format_detection import detect_format
 from app.integrity import safe_quick_fingerprint
@@ -18,6 +20,8 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
+
+logger = logging.getLogger(__name__)
 
 
 class MetadataReader:
@@ -29,11 +33,8 @@ class MetadataReader:
     @classmethod
     def from_settings(cls, settings: AppSettings) -> "MetadataReader":
         """Build a reader honouring exiftool_path, exiftool_batch_size, and worker_count."""
-        executable = Path(settings.exiftool_path) if settings.exiftool_path.strip() else None
-        if executable is not None and not executable.exists():
-            executable = None
         return cls(
-            exiftool=ExifToolRunner(executable, batch_size=settings.exiftool_batch_size),
+            exiftool=ExifToolRunner.from_settings(settings),
             worker_count=settings.worker_count,
             batch_size=settings.exiftool_batch_size,
         )
@@ -45,20 +46,47 @@ class MetadataReader:
         cancel_event: threading.Event,
         progress: Callable[[int, int], None] | None = None,
         settings: AppSettings | None = None,
+        exif_progress: Callable[[int, int], None] | None = None,
     ) -> list[PhotoMetadata]:
+        """Read metadata for every path.
+
+        ``exif_progress`` reports the ExifTool stage (files whose EXIF has been
+        read so far), which on a large folder is where most of the time goes;
+        ``progress`` reports the per-file stage that follows. Cancellation is
+        honoured between ExifTool batches, and a batch ExifTool cannot read
+        degrades those files to the fallback path (with a warning on each)
+        instead of aborting the whole analysis.
+        """
         worker_count = max(1, settings.worker_count) if settings else self.worker_count
         batch_size = max(1, settings.exiftool_batch_size) if settings else self.batch_size
         exif_available = self.exiftool.available
-        exif_records = self.exiftool.read_many(paths, batch_size) if exif_available else {}
         total = len(paths)
+        exif_records: dict[Path, dict[str, Any]] = {}
+        exif_failures: dict[Path, str] = {}
+        if exif_available:
+            for start in range(0, total, batch_size):
+                if cancel_event.is_set():
+                    break
+                chunk = paths[start : start + batch_size]
+                try:
+                    exif_records.update(self.exiftool.read_many(chunk, batch_size))
+                except (ExifToolError, ExifToolTimeoutError) as exc:
+                    logger.warning("ExifTool failed for a batch of %d files: %s", len(chunk), exc)
+                    for path in chunk:
+                        exif_failures[path.resolve()] = exc.user_message
+                if exif_progress:
+                    exif_progress(min(start + len(chunk), total), total)
         results: list[PhotoMetadata | None] = [None] * total
 
         def read_index(index: int) -> None:
             path = paths[index]
-            record = exif_records.get(path.resolve(), {})
+            resolved = path.resolve()
+            record = exif_records.get(resolved, {})
             item = self._read_one(path, source_root, record)
             if not exif_available:
                 item.warnings.insert(0, "ExifTool недоступен; включён аварийный режим с пониженной точностью.")
+            elif resolved in exif_failures:
+                item.warnings.insert(0, f"ExifTool не прочитал файл ({exif_failures[resolved]}); использован аварийный режим.")
             results[index] = item
 
         if worker_count == 1:

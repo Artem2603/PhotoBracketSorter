@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -56,17 +57,27 @@ def render_output_folder_name(template: str, now: datetime | None = None) -> str
     }
     try:
         rendered = (template or DEFAULT_OUTPUT_TEMPLATE).format(**values)
-    except (KeyError, IndexError, ValueError):
+    except Exception:
+        # KeyError/IndexError/ValueError for unknown or malformed placeholders,
+        # AttributeError for things like ``{date.year}``: all fall back.
         rendered = DEFAULT_OUTPUT_TEMPLATE.format(**values)
     rendered = sanitize_component(rendered)
     return rendered or DEFAULT_OUTPUT_TEMPLATE.format(**values)
+
+
+#: Device names Windows refuses as file or folder names, with or without an extension.
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
 def sanitize_component(name: str) -> str:
     """Strip characters that cannot appear in a Windows path component."""
     cleaned = "".join("_" if char in _INVALID_NAME_CHARS else char for char in name)
     cleaned = "".join(char for char in cleaned if ord(char) >= 32)
-    return cleaned.strip(" .")
+    cleaned = cleaned.strip(" .")
+    stem = cleaned.split(".", 1)[0]
+    if stem.upper() in _RESERVED_NAMES:
+        cleaned = f"{stem}_" + cleaned[len(stem):]
+    return cleaned
 
 
 def make_unique_output_root(
@@ -88,9 +99,15 @@ def make_unique_output_root(
 
 def _reject_mtp(path: Path) -> None:
     text = str(path)
-    if text.startswith("::") or "mtp" in text.lower():
+    # Shell namespace paths ("::{GUID}\\...") and mtp:// URIs are virtual device
+    # views. A folder that merely contains the letters "mtp" (C:\\Photos\\MTP_backup)
+    # is an ordinary folder and used to be rejected by a substring check.
+    if text.startswith("::") or text.lower().startswith(("mtp:", "mtp//")):
         raise MTPPathError("Виртуальный MTP-путь не поддерживается.", text)
-    if not path.drive and path.is_absolute():
+    # A drive letter is a Windows concept; on POSIX every absolute path lacks
+    # one, so the check only applies where it means something. This lets the
+    # test suite and the core run on Linux/macOS development machines.
+    if os.name == "nt" and not path.drive and path.is_absolute():
         raise UnsupportedPathError("Путь без Windows-диска не поддерживается.", text)
 
 

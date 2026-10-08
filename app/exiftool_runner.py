@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import contextlib
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -77,19 +82,48 @@ EXIF_TAGS = (
 )
 
 
+#: Embedded-JPEG tags, largest first.
+PREVIEW_TAGS = ("PreviewImage", "JpgFromRaw", "ThumbnailImage")
+
+
 class ExifToolRunner:
     def __init__(self, executable: Path | None = None, timeout_seconds: int = 60, batch_size: int = 80):
         # An explicit path from Settings wins; discovery is the fallback.
         self.executable = executable or find_exiftool()
         self.timeout_seconds = timeout_seconds
         self.batch_size = max(1, int(batch_size))
+        self._probe_result: bool | None = None
+
+    @classmethod
+    def from_settings(cls, settings: Any) -> "ExifToolRunner":
+        """Honour ``exiftool_path`` (when it points at a real file) and ``exiftool_batch_size``."""
+        raw = str(getattr(settings, "exiftool_path", "") or "").strip()
+        executable = Path(raw).expanduser() if raw else None
+        if executable is not None and not executable.is_file():
+            executable = None
+        batch_size = getattr(settings, "exiftool_batch_size", 80) or 80
+        return cls(executable, batch_size=int(batch_size))
 
     @property
     def available(self) -> bool:
-        return self.executable is not None and self.executable.exists() and exiftool_files_dir(self.executable).exists()
+        if self.executable is None or not self.executable.exists():
+            return False
+        if exiftool_files_dir(self.executable).exists():
+            return True
+        # Not the bundled Windows layout (a system exiftool on PATH, or an
+        # explicit path from Settings): probe it once instead of assuming it
+        # is broken. Previously such executables were silently ignored.
+        if self._probe_result is None:
+            self._probe_result = self._run_version() is not None
+        return self._probe_result
 
     def version(self) -> str | None:
         if not self.available or self.executable is None:
+            return None
+        return self._run_version()
+
+    def _run_version(self) -> str | None:
+        if self.executable is None:
             return None
         try:
             completed = subprocess.run(
@@ -121,8 +155,37 @@ class ExifToolRunner:
                     records[Path(str(source)).resolve()] = record
         return records
 
+    def _chunk_timeout(self, count: int) -> float:
+        """A fixed 60 s used to cover a 1000-file batch on a slow USB disk; scale with the batch."""
+        return max(float(self.timeout_seconds), 10.0 + 2.0 * count)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _argfile(paths: list[Path]) -> Iterator[str]:
+        """Hand file names to ExifTool through a UTF-8 argfile (``-@``).
+
+        On Windows the Perl launcher receives command-line arguments in the
+        ANSI code page, so a path like ``C:\\Users\\Артём\\DCIM`` arrives
+        mangled and ExifTool answers "File not found" for every file in it,
+        silently dropping all metadata. ExifTool's own documentation prescribes
+        ``-charset filename=UTF8`` plus a UTF-8 argfile for exactly this case;
+        it also sidesteps the 32 767-character command-line limit for big
+        batches of long paths.
+        """
+        handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".args", prefix="pbs-exiftool-", delete=False)
+        try:
+            with handle:
+                for path in paths:
+                    handle.write(str(path) + "\n")
+            yield handle.name
+        finally:
+            try:
+                os.unlink(handle.name)
+            except OSError:
+                pass
+
     def _read_chunk(self, paths: list[Path]) -> list[dict[str, Any]]:
-        if self.executable is None:
+        if self.executable is None or not paths:
             return []
         command = [
             str(self.executable),
@@ -134,19 +197,24 @@ class ExifToolRunner:
             "filename=UTF8",
         ]
         command.extend(f"-{tag}" for tag in EXIF_TAGS)
-        command.extend(str(path) for path in paths)
         try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.timeout_seconds,
-                check=False,
-            )
+            with self._argfile(paths) as argfile:
+                completed = subprocess.run(
+                    [*command, "-@", argfile],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self._chunk_timeout(len(paths)),
+                    check=False,
+                )
         except subprocess.TimeoutExpired as exc:
             raise ExifToolTimeoutError(technical_reason=str(exc)) from exc
+        except OSError as exc:
+            # A blocked or quarantined exiftool.exe (antivirus, missing
+            # permissions) surfaces here; keep it inside the app's error
+            # hierarchy so the caller can fall back instead of crashing.
+            raise ExifToolError(technical_reason=f"{type(exc).__name__}: {exc}") from exc
         if completed.returncode not in {0, 1}:
             raise ExifToolError(technical_reason=completed.stderr.strip())
         try:
@@ -168,18 +236,60 @@ class ExifToolRunner:
         """
         if not self.available or self.executable is None:
             return None
-        command = [str(self.executable), "-b", f"-{tag}", str(path)]
+        command = [str(self.executable), "-b", "-charset", "filename=UTF8", f"-{tag}"]
         try:
-            completed = subprocess.run(command, capture_output=True, timeout=self.timeout_seconds, check=False)
+            with self._argfile([path]) as argfile:
+                completed = subprocess.run([*command, "-@", argfile], capture_output=True, timeout=self.timeout_seconds, check=False)
         except (OSError, subprocess.TimeoutExpired):
             return None
         if completed.returncode not in (0, 1) or not completed.stdout:
             return None
         return completed.stdout
 
+    def extract_embedded_previews(self, paths: list[Path]) -> dict[Path, tuple[bytes, str]]:
+        """Largest embedded JPEG for many files in ONE ExifTool call.
+
+        Returns ``{resolved_path: (jpeg_bytes, tag_used)}`` and omits files
+        without an embedded preview. ``-json -b`` makes ExifTool emit binary
+        tags as ``base64:…`` strings, so one process serves a whole burst
+        instead of up to three processes per frame. Never raises.
+        """
+        if not self.available or self.executable is None or not paths:
+            return {}
+        command = [str(self.executable), "-json", "-b", "-api", "LargeFileSupport=1", "-charset", "filename=UTF8"]
+        command.extend(f"-{tag}" for tag in PREVIEW_TAGS)
+        try:
+            with self._argfile(paths) as argfile:
+                completed = subprocess.run([*command, "-@", argfile], capture_output=True, timeout=self._chunk_timeout(len(paths)), check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        if completed.returncode not in (0, 1) or not completed.stdout:
+            return {}
+        try:
+            data = json.loads(completed.stdout.decode("utf-8", errors="replace") or "[]")
+        except ValueError:
+            return {}
+        results: dict[Path, tuple[bytes, str]] = {}
+        if not isinstance(data, list):
+            return results
+        for record in data:
+            if not isinstance(record, dict) or not record.get("SourceFile"):
+                continue
+            for tag in PREVIEW_TAGS:
+                value = record.get(tag)
+                if isinstance(value, str) and value.startswith("base64:"):
+                    try:
+                        payload = base64.b64decode(value[7:], validate=False)
+                    except (ValueError, TypeError):
+                        continue
+                    if payload:
+                        results[Path(str(record["SourceFile"])).resolve()] = (payload, tag)
+                        break
+        return results
+
     def extract_embedded_preview(self, path: Path) -> tuple[bytes | None, str]:
         """Try the common embedded-JPEG tags in size order. Returns (data, tag_used)."""
-        for tag in ("PreviewImage", "JpgFromRaw", "ThumbnailImage"):
+        for tag in PREVIEW_TAGS:
             data = self.extract_binary_tag(path, tag)
             if data:
                 return data, tag
@@ -187,6 +297,11 @@ class ExifToolRunner:
 
 
 def find_exiftool() -> Path | None:
+    # The bundled exiftool.exe is a Windows binary; on other platforms the
+    # system exiftool (if any) is the only thing that can run.
+    if os.name != "nt":
+        found = shutil.which("exiftool")
+        return Path(found) if found else None
     candidates: list[Path] = []
     for base in _runtime_bases():
         candidates.extend(

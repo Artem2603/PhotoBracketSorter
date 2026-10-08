@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import uuid
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,7 @@ from app.errors import ProfileError, SettingsError
 from app.exposure import SOURCE_PRIORITY
 from app.models import AppSettings, BracketSeries
 from app.settings import validate_settings
+from app.time_compare import safe_file_time_difference_seconds, sort_photo_files_by_capture_time
 
 CURRENT_PROFILE_SCHEMA = 2
 
@@ -156,10 +159,19 @@ def _load_bundled_profile(path: Path) -> CameraProfile | None:
         return None
     if not isinstance(data, dict):
         return None
-    migrated = migrate_profile_dict(data)
-    profile = _profile_from_dict(migrated)
+    try:
+        profile = _profile_from_dict(migrate_profile_dict(data))
+    except ProfileError:
+        return None  # one malformed bundled file must not take the whole profile list down
     profile.is_builtin = True
+    # A bundled profile is identified by its file, so the id is the same on
+    # every load: find_profile / _is_builtin_id can match what the GUI stored.
+    profile.profile_id = _bundled_profile_id(path)
     return profile
+
+
+def _bundled_profile_id(path: Path) -> str:
+    return f"bundled:{path.stem}"
 
 
 def bundled_profiles() -> list[CameraProfile]:
@@ -187,7 +199,11 @@ def migrate_profile_dict(data: dict[str, Any]) -> dict[str, Any]:
     Schema 1 had no per-size duration split, so ``bracket_duration_seconds``
     seeds both ``max_bracket_duration_seconds_3`` and ``_5``.
     """
-    schema = int(data.get("schema_version", 1) or 1)
+    raw_schema = data.get("schema_version", 1)
+    try:
+        schema = int(raw_schema) if raw_schema not in (None, "") else 1
+    except (TypeError, ValueError) as exc:
+        raise ProfileError(f"Некорректная версия схемы профиля: {raw_schema!r}.") from exc
     if schema > CURRENT_PROFILE_SCHEMA:
         raise ProfileError(f"Версия профиля {schema} новее поддерживаемой {CURRENT_PROFILE_SCHEMA}.")
     migrated = dict(data)
@@ -202,7 +218,10 @@ def migrate_profile_dict(data: dict[str, Any]) -> dict[str, Any]:
             migrated.setdefault("max_bracket_duration_seconds_5", duration)
         sizes = migrated.pop("expected_bracket_sizes", None)
         if sizes:
-            unique = sorted(set(int(size) for size in sizes))
+            try:
+                unique = sorted({int(size) for size in sizes})
+            except (TypeError, ValueError) as exc:
+                raise ProfileError(f"Некорректное значение expected_bracket_sizes: {sizes!r}.") from exc
             if unique == [3]:
                 migrated.setdefault("bracket_size_mode", "THREE")
             elif unique == [5]:
@@ -213,17 +232,69 @@ def migrate_profile_dict(data: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+#: CameraProfile fields grouped by the JSON type each accepts. Every field is in
+#: exactly one group (plus ``schema_version``/``is_builtin``, handled apart), so
+#: a malformed value can only ever become a ProfileError, never a bare
+#: TypeError/ValueError escaping from the dataclass or a later conversion.
+_TEXT_FIELDS = ("profile_id", "name", "manufacturer", "model", "description", "bracket_size_mode")
+_BOOL_FIELDS = ("is_auto", "use_name_for_pairing", "use_exif_for_pairing", "use_preview_for_pairing")
+_NUMBER_FIELDS = (
+    "min_exposure_span_ev",
+    "exposure_step_tolerance",
+    "max_bracket_duration_seconds_3",
+    "max_bracket_duration_seconds_5",
+    "max_bracket_adjacent_delta_seconds",
+    "max_pair_delta_seconds",
+    "min_auto_confidence",
+)
+_LIST_FIELDS = ("raw_formats", "rendered_formats", "exposure_source_priority")
+
+
 def _profile_from_dict(data: dict[str, Any]) -> CameraProfile:
     migrated = migrate_profile_dict(data)
     allowed = {field.name for field in dataclasses.fields(CameraProfile)}
-    values = {key: value for key, value in migrated.items() if key in allowed and key != "is_builtin"}
-    for key in ("raw_formats", "rendered_formats", "exposure_source_priority"):
-        if key in values and not isinstance(values[key], tuple):
-            values[key] = tuple(str(item) for item in values[key])
+    values: dict[str, Any] = {}
+    for key, value in migrated.items():
+        if key not in allowed or key == "is_builtin":
+            continue
+        if value is None:
+            continue  # JSON null falls back to the default, like a missing key
+        values[key] = _coerce_profile_value(key, value)
     values.setdefault("profile_id", uuid.uuid4().hex)
     profile = CameraProfile(**values)
     profile.schema_version = CURRENT_PROFILE_SCHEMA
     return profile
+
+
+def _coerce_profile_value(key: str, value: Any) -> Any:
+    """One JSON value -> the type ``CameraProfile`` expects, or ``ProfileError``."""
+    if key == "schema_version":
+        return CURRENT_PROFILE_SCHEMA  # migrate_profile_dict already validated and rewrote it
+    if key in _BOOL_FIELDS:
+        if isinstance(value, bool):
+            return value
+        raise _bad_profile_value(key, value, "ожидается true или false")
+    if key in _NUMBER_FIELDS:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise _bad_profile_value(key, value, "ожидается число")
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise _bad_profile_value(key, value, "ожидается число") from exc
+        if not math.isfinite(number):
+            raise _bad_profile_value(key, value, "ожидается конечное число")
+        return number
+    if key in _LIST_FIELDS:
+        if isinstance(value, str) or not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
+            raise _bad_profile_value(key, value, "ожидается список строк")
+        return tuple(value)
+    if not isinstance(value, str):  # _TEXT_FIELDS
+        raise _bad_profile_value(key, value, "ожидается строка")
+    return value
+
+
+def _bad_profile_value(key: str, value: Any, expectation: str) -> ProfileError:
+    return ProfileError(f"Некорректное значение поля профиля «{key}»: {value!r} ({expectation}).")
 
 
 # ------------------------------------------------------------ user profiles
@@ -353,13 +424,23 @@ def profile_from_confirmed_series(series: BracketSeries, name: str, manufacturer
     "derive from real algorithm output" rule the auto-configurer and the
     decision explainer both follow.
     """
+    defaults = AppSettings()
     step = series.estimated_step_ev
     span = max(series.exposure_values) - min(series.exposure_values) if len(series.exposure_values) >= 2 else None
-    duration = series.duration_seconds or AppSettings().max_bracket_duration_seconds_3
+    duration = series.duration_seconds or defaults.max_bracket_duration_seconds_3
     size_mode = {3: "THREE", 5: "FIVE"}.get(series.series_size, "BOTH")
     priority = _DEFAULT_EXPOSURE_PRIORITY
     if series.exposure_source and series.exposure_source not in {"UNKNOWN", "PARTIAL"}:
         priority = (series.exposure_source, *(value for value in _DEFAULT_EXPOSURE_PRIORITY if value != series.exposure_source))
+    # Timing comes from the series as a whole, not the duration alone: a fast
+    # phone bracket (0.4 s for three frames) must also tighten the adjacent-frame
+    # gap, otherwise the default 1.2 s gap exceeds the derived duration and the
+    # profile fails validate_settings ("duration >= adjacent") before it is ever
+    # saved. Same x1.5 headroom as the auto-configurer; 0.3 s floor so sub-second
+    # timestamps rounded to whole seconds still leave room.
+    gap = _max_adjacent_gap_seconds(series)
+    adjacent = round(max(0.3, gap * 1.5), 2) if gap is not None else defaults.max_bracket_adjacent_delta_seconds
+    own_duration = round(max(adjacent, 0.5, duration * 1.5), 2)
     profile = CameraProfile(
         name=name,
         manufacturer=manufacturer,
@@ -368,13 +449,31 @@ def profile_from_confirmed_series(series: BracketSeries, name: str, manufacturer
         bracket_size_mode=size_mode,
         min_exposure_span_ev=round(max(0.1, (span or 0.7) * 0.6), 2),
         exposure_step_tolerance=round(max(0.1, (step or 0.45) * 0.3), 2) if step else 0.45,
-        max_bracket_duration_seconds_3=round(max(0.5, duration * 1.5), 2) if series.series_size == 3 else AppSettings().max_bracket_duration_seconds_3,
-        max_bracket_duration_seconds_5=round(max(0.5, duration * 1.5), 2) if series.series_size == 5 else AppSettings().max_bracket_duration_seconds_5,
+        max_bracket_duration_seconds_3=own_duration if series.series_size == 3 else max(defaults.max_bracket_duration_seconds_3, adjacent),
+        max_bracket_duration_seconds_5=own_duration if series.series_size == 5 else max(defaults.max_bracket_duration_seconds_5, adjacent),
+        max_bracket_adjacent_delta_seconds=adjacent,
         exposure_source_priority=priority,
         min_auto_confidence=round(min(99.0, max(50.0, series.confidence - 5.0)), 1),
     )
     _validate_profile(profile)
     return profile
+
+
+def _max_adjacent_gap_seconds(series: BracketSeries) -> float | None:
+    """Largest gap between neighbouring frames, measured from the frames themselves.
+
+    Falls back to even spacing over ``duration_seconds`` when the series carries
+    no per-frame times (a restored session, a report-only series), and to
+    ``None`` when it carries no timing at all.
+    """
+    ordered = sort_photo_files_by_capture_time(list(series.raw_files))
+    gaps = [safe_file_time_difference_seconds(left, right).absolute_seconds for left, right in pairwise(ordered)]
+    measured = [gap for gap in gaps if gap is not None]
+    if measured:
+        return max(measured)
+    if series.duration_seconds and series.series_size > 1:
+        return series.duration_seconds / (series.series_size - 1)
+    return None
 
 
 # --------------------------------------------------------------------- apply

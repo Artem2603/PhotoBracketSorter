@@ -1,4 +1,4 @@
-"""Tkinter GUI for Photo Bracket Sorter 1.1.0."""
+"""Tkinter GUI for Photo Bracket Sorter."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 from app.analysis import analyze_folder, collect_candidate_paths
-from app.auto_configure import AutoConfigReport, SettingSuggestion, analyze_for_suggestions, apply_suggestions
+from app.auto_configure import AutoConfigReport, analyze_for_suggestions, apply_suggestions
 from app.camera_profiles import user_profiles_path
 from app.copy_engine import CopyEngine
 from app.copy_plan import build_copy_plan
@@ -39,17 +39,50 @@ from app.operation_journal import (
     undo_move,
 )
 from app.paths import validate_source
-from app.preview_loader import PreviewCache, load_tk_preview
+from app.preview_loader import PreviewCache, PreviewInfo, load_preview_info
 from app.reporting import write_reports
-from app.review_queue import ReviewItem, ReviewReason, build_review_queue, confirm_candidate, dismiss_candidate, exclude_files, merge_series, restore_automatic, split_series
+from app.review_queue import ReviewItem, build_review_queue, confirm_candidate, dismiss_candidate, exclude_files, merge_series, restore_automatic, split_series
 from app.series_manager import SeriesManager, compute_statistics
-from app.settings import default_settings_path, load_settings, save_settings, settings_from_dict, validate_settings
-from app.theme_manager import apply_theme
+from app.settings import default_settings_path, load_settings, save_settings, validate_settings
+from app.theme_manager import BOOTSTRAP_AVAILABLE, apply_theme, button_style, is_dark_theme, release_style
 from app.version import APP_NAME, __version__
 
 
 FILTERS = ("all", "ready", "raw", "hdr3", "hdr5", "review", "errors", "duplicates")
 UI_MODE_KEYS = ("advanced", "simple")
+THEME_KEYS = ("system", "light", "dark")
+DEFAULT_GEOMETRY = "1440x900"
+#: Stat cards double as filter shortcuts; each key is also a FILTERS entry.
+STAT_KEYS = ("ready", "raw", "hdr3", "hdr5", "review", "errors")
+#: Colour role per stat card / table row tag, resolved against the active theme.
+STAT_ROLES = {"ready": "success", "raw": "info", "hdr3": "primary", "hdr5": "primary", "review": "warning", "errors": "danger"}
+#: Fallback palette when ttkbootstrap is absent (plain ttk has no named colours).
+FALLBACK_COLORS = {
+    "primary": "#2c7be5",
+    "success": "#1f9d55",
+    "info": "#2a9fd6",
+    "warning": "#d98c00",
+    "danger": "#c0392b",
+    "secondary": "#7f8c8d",
+    "border": "#c8ccd0",
+    "bg": "#f5f6f7",
+}
+#: Background-worker phase names (kept in Russian inside the core so reports
+#: and logs stay stable) mapped to catalog keys for the status bar.
+PHASE_KEYS = {
+    "Проверка папок": "phase.check_folders",
+    "Сканирование": "phase.scan",
+    "Определение форматов": "phase.detect_formats",
+    "Чтение EXIF": "phase.read_exif",
+    "Чтение метаданных": "phase.read_metadata",
+    "Поиск RAW + HEIC": "phase.pairing",
+    "Готово к проверке": "phase.ready",
+    "Создание структуры": "phase.create_structure",
+    "Копирование": "phase.copying",
+    "Удаление исходника": "phase.deleting_source",
+    "Финальная проверка": "phase.final_check",
+    "Восстановление": "phase.restoring",
+}
 #: Action buttons hidden in simple mode, leaving the 5-step flow: choose
 #: source, choose output, analyze, review the table, Copy/Move.
 ADVANCED_ONLY_ACTIONS = (
@@ -68,12 +101,12 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         self.settings_path = default_settings_path()
         self.profiles_path = user_profiles_path()
         self.journal_path = journal_path()
-        self.settings = load_settings(self.settings_path)
+        self.settings, settings_problem = _load_settings_or_defaults(self.settings_path)
         self.i18n = I18n(self.settings.language)
         apply_theme(self, self.settings)
         self.title(f"{self.i18n.gettext('app.title')} {__version__}")
-        self.geometry(self.settings.window_geometry or "1440x900")
-        self.minsize(1100, 720)
+        self.geometry(self._initial_geometry(self.settings.window_geometry or DEFAULT_GEOMETRY))
+        self.minsize(1024, 680)
         self.tk.call("tk", "scaling", self.settings.ui_scale)
 
         self.analysis: AnalysisResult | None = None
@@ -98,25 +131,45 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         self.search_var = tk.StringVar()
         self.filter_var = tk.StringVar(value=self._filter_label("all"))
         self.language_var = tk.StringVar(value=LANGUAGE_LABELS.get(self.settings.language, "English"))
-        self.theme_var = tk.StringVar(value=self.settings.theme)
+        self.theme_var = tk.StringVar(value=self._theme_label(self.settings.theme))
         self.ui_mode_var = tk.StringVar(value=self._ui_mode_label(self.settings.ui_mode))
         self.status_var = tk.StringVar(value=self.i18n.gettext("app.ready"))
         self.free_space_var = tk.StringVar(value="")
         self.exiftool_var = tk.StringVar(value=self._exiftool_status())
-        self.stats_vars = {
-            "ready": tk.StringVar(value="0"),
-            "raw": tk.StringVar(value="0"),
-            "hdr3": tk.StringVar(value="0"),
-            "hdr5": tk.StringVar(value="0"),
-            "review": tk.StringVar(value="0"),
-            "errors": tk.StringVar(value="0"),
-        }
+        self.stats_vars = {key: tk.StringVar(value="0") for key in STAT_KEYS}
+        self.stat_cards: dict[str, tk.Frame] = {}
+        self.stat_numbers: dict[str, ttk.Label] = {}
 
         self._build()
         self._bind_shortcuts()
         self._refresh_texts()
+        self._apply_theme_colors()
         self._update_free_space()
         self.after(100, self._poll_events)
+        if settings_problem:
+            self.after(200, lambda: self._report_settings_problem(settings_problem))
+
+    def destroy(self) -> None:
+        # The ttkbootstrap Style singleton is bound to this interpreter; drop it
+        # with the window so a later MainWindow in the same process starts clean.
+        try:
+            super().destroy()
+        finally:
+            release_style()
+
+    def _initial_geometry(self, geometry: str) -> str:
+        """Clamp a remembered geometry to the current screen.
+
+        A window saved on a 1440p monitor must not open larger than a laptop
+        screen, and an offset that belonged to a monitor that is no longer
+        attached is dropped so the window cannot open off-screen.
+        """
+        return clamp_geometry(geometry, self.winfo_screenwidth(), self.winfo_screenheight())
+
+    def _report_settings_problem(self, reason: str) -> None:
+        message = self.i18n.gettext("message.settings_reset", path=str(self.settings_path), reason=reason)
+        self._log(message)
+        messagebox.showwarning(APP_NAME, message)
 
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -142,9 +195,11 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         language.grid(row=0, column=3)
         language.bind("<<ComboboxSelected>>", lambda _event: self._change_language())
         self._label(frame, "top.theme").grid(row=0, column=4, padx=(12, 4))
-        theme = ttk.Combobox(frame, textvariable=self.theme_var, values=("system", "light", "dark"), width=9, state="readonly")
-        theme.grid(row=0, column=5)
-        theme.bind("<<ComboboxSelected>>", lambda _event: self._change_theme())
+        self.theme_combo = ttk.Combobox(
+            frame, textvariable=self.theme_var, values=tuple(self._theme_label(key) for key in THEME_KEYS), width=11, state="readonly"
+        )
+        self.theme_combo.grid(row=0, column=5)
+        self.theme_combo.bind("<<ComboboxSelected>>", lambda _event: self._change_theme())
         self._label(frame, "top.ui_mode").grid(row=0, column=7, padx=(12, 4))
         self.ui_mode_combo = ttk.Combobox(
             frame, textvariable=self.ui_mode_var, values=tuple(self._ui_mode_label(key) for key in UI_MODE_KEYS), width=14, state="readonly"
@@ -176,20 +231,23 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
     def _build_actions(self) -> None:
         frame = ttk.Frame(self, padding=(12, 4, 12, 8))
         frame.grid(row=2, column=0, sticky="ew")
-        self.analyze_button = self._button(frame, "action.analyze", self._start_analysis)
-        self.auto_configure_button = self._button(frame, "action.auto_configure", self._start_auto_configure)
-        self.review_queue_button = self._button(frame, "action.review_queue", self._open_review_queue, state="disabled")
-        self.sort_preview_button = self._button(frame, "action.sort_preview", self._open_sort_preview, state="disabled")
-        self.copy_button = self._button(frame, "action.copy", lambda: self._start_transfer("copy"), state="disabled")
-        self.move_button = self._button(frame, "action.move", lambda: self._start_transfer("move"), state="disabled")
-        self.cancel_button = self._button(frame, "action.cancel", self._cancel, state="disabled")
-        self.reset_button = self._button(frame, "action.reset", self._reset)
-        self.open_result_button = self._button(frame, "action.open_result", self._open_last_result, state="disabled")
-        self.settings_button = self._button(frame, "action.settings", self._open_settings)
-        self.history_button = self._button(frame, "action.history", self._open_history)
-        self.save_session_button = self._button(frame, "action.save_session", self._save_session, state="disabled")
-        self.open_session_button = self._button(frame, "action.open_session", self._start_open_session)
-        for index, button in enumerate(
+        # Row 0 is the workflow (analyze, refine, transfer); row 1 holds the
+        # utilities. Thirteen equal buttons in one row overflowed a 1440px
+        # window in Russian and gave Copy and Move no visual weight.
+        self.analyze_button = self._button(frame, "action.analyze", self._start_analysis, role="primary")
+        self.auto_configure_button = self._button(frame, "action.auto_configure", self._start_auto_configure, role="outline")
+        self.review_queue_button = self._button(frame, "action.review_queue", self._open_review_queue, state="disabled", role="outline")
+        self.sort_preview_button = self._button(frame, "action.sort_preview", self._open_sort_preview, state="disabled", role="outline")
+        self.copy_button = self._button(frame, "action.copy", lambda: self._start_transfer("copy"), state="disabled", role="copy")
+        self.move_button = self._button(frame, "action.move", lambda: self._start_transfer("move"), state="disabled", role="move")
+        self.cancel_button = self._button(frame, "action.cancel", self._cancel, state="disabled", role="danger")
+        self.reset_button = self._button(frame, "action.reset", self._reset, role="secondary")
+        self.open_result_button = self._button(frame, "action.open_result", self._open_last_result, state="disabled", role="secondary")
+        self.settings_button = self._button(frame, "action.settings", self._open_settings, role="secondary")
+        self.history_button = self._button(frame, "action.history", self._open_history, role="secondary")
+        self.save_session_button = self._button(frame, "action.save_session", self._save_session, state="disabled", role="secondary")
+        self.open_session_button = self._button(frame, "action.open_session", self._start_open_session, role="secondary")
+        rows = (
             (
                 self.analyze_button,
                 self.auto_configure_button,
@@ -198,26 +256,37 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
                 self.copy_button,
                 self.move_button,
                 self.cancel_button,
+            ),
+            (
                 self.reset_button,
                 self.open_result_button,
                 self.settings_button,
                 self.history_button,
                 self.save_session_button,
                 self.open_session_button,
-            )
-        ):
-            button.grid(row=0, column=index, padx=(0, 8))
+            ),
+        )
+        for row, buttons in enumerate(rows):
+            for column, button in enumerate(buttons):
+                button.grid(row=row, column=column, padx=(0, 8), pady=(0, 6) if row == 0 else 0, sticky="w")
 
     def _build_stats_and_filters(self) -> None:
         frame = ttk.Frame(self, padding=(12, 0, 12, 8))
         frame.grid(row=3, column=0, sticky="ew")
-        for index, key in enumerate(("ready", "raw", "hdr3", "hdr5", "review", "errors")):
-            card = ttk.Frame(frame, padding=(10, 6))
-            card.grid(row=0, column=index, sticky="ew", padx=(0, 8))
-            ttk.Label(card, textvariable=self.stats_vars[key], font=("Segoe UI", 13, "bold")).pack(anchor="w")
-            label = ttk.Label(card)
+        for index, key in enumerate(STAT_KEYS):
+            # A thin-bordered tk.Frame reads as a card on every theme; clicking
+            # it applies the matching table filter.
+            card = tk.Frame(frame, highlightthickness=1, bd=0, padx=12, pady=6, cursor="hand2")
+            card.grid(row=0, column=index, sticky="ew", padx=(0, 8), ipadx=4)
+            number = ttk.Label(card, textvariable=self.stats_vars[key], font=("Segoe UI", 15, "bold"), cursor="hand2")
+            number.pack(anchor="w")
+            label = ttk.Label(card, cursor="hand2")
             label.pack(anchor="w")
             self.localized.append((label, "text", f"filter.{key}"))
+            for widget in (card, number, label):
+                widget.bind("<Button-1>", lambda _event, filter_key=key: self._select_filter(filter_key))
+            self.stat_cards[key] = card
+            self.stat_numbers[key] = number
         filter_frame = ttk.Frame(frame)
         filter_frame.grid(row=0, column=6, sticky="e")
         values = tuple(self._filter_label(key) for key in FILTERS)
@@ -345,10 +414,77 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         self.localized.append((widget, "text", key))
         return widget
 
-    def _button(self, parent, key: str, command, state: str = "normal") -> ttk.Button:
-        widget = ttk.Button(parent, command=command, state=state)
+    def _button(self, parent, key: str, command, state: str = "normal", role: str | None = None) -> ttk.Button:
+        style = button_style(self.settings, role) if role else None
+        widget = ttk.Button(parent, command=command, state=state, style=style) if style else ttk.Button(parent, command=command, state=state)
         self.localized.append((widget, "text", key))
         return widget
+
+    def _theme_label(self, key: str) -> str:
+        return self.i18n.gettext(f"theme.{key}")
+
+    def _current_theme_key(self) -> str:
+        label = self.theme_var.get()
+        for key in THEME_KEYS:
+            if self._theme_label(key) == label:
+                return key
+        return label if label in THEME_KEYS else "system"
+
+    def _theme_color(self, role: str) -> str:
+        """Resolve a bootstrap colour role against the active theme (or the fallback palette)."""
+        if BOOTSTRAP_AVAILABLE:
+            try:
+                import ttkbootstrap as tb
+
+                colors = tb.Style.instance.colors if tb.Style.instance is not None else None
+                value = colors.get(role) if colors is not None else None
+                if value:
+                    return str(value)
+            except Exception:
+                pass
+        return FALLBACK_COLORS.get(role, FALLBACK_COLORS["primary"])
+
+    def _apply_theme_colors(self) -> None:
+        """Re-colour the pieces that do not follow the ttk theme automatically."""
+        dark = is_dark_theme(self.settings)
+        background = self._theme_color("bg")
+        border = self._theme_color("border") if BOOTSTRAP_AVAILABLE else ("#4a4f55" if dark else FALLBACK_COLORS["border"])
+        for key, card in self.stat_cards.items():
+            try:
+                card.configure(background=background, highlightbackground=border, highlightcolor=border)
+                self.stat_numbers[key].configure(foreground=self._theme_color(STAT_ROLES[key]))
+            except tk.TclError:
+                continue
+        if hasattr(self, "tree"):
+            self._configure_row_tags()
+        for widget in (getattr(self, "log_text", None), getattr(self, "metadata_text", None), getattr(self, "reasons_text", None)):
+            if widget is None:
+                continue
+            try:
+                widget.configure(
+                    background=self._theme_color("inputbg") if BOOTSTRAP_AVAILABLE else ("#1e1e1e" if dark else "white"),
+                    foreground=self._theme_color("inputfg") if BOOTSTRAP_AVAILABLE else ("#e6e6e6" if dark else "black"),
+                    insertbackground=self._theme_color("inputfg") if BOOTSTRAP_AVAILABLE else ("#e6e6e6" if dark else "black"),
+                    relief="flat",
+                    highlightthickness=1,
+                    highlightbackground=border,
+                    highlightcolor=border,
+                )
+            except tk.TclError:
+                continue
+
+    def _configure_row_tags(self) -> None:
+        """Row colours by outcome: errors red, review amber, series accent, skipped muted."""
+        self.tree.tag_configure("error", foreground=self._theme_color("danger"))
+        self.tree.tag_configure("review", foreground=self._theme_color("warning"))
+        self.tree.tag_configure("series", foreground=self._theme_color("primary"))
+        self.tree.tag_configure("skip", foreground=self._theme_color("secondary"))
+
+    def _select_filter(self, key: str) -> None:
+        """Stat-card click: apply that filter, or clear it when it is already active."""
+        target = "all" if self._current_filter_key() == key else key
+        self.filter_var.set(self._filter_label(target))
+        self._populate_table()
 
     def _refresh_texts(self) -> None:
         self.title(f"{self.i18n.gettext('app.title')} {__version__}")
@@ -385,6 +521,9 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
             # not from the still-old-language label currently on screen.
             self.ui_mode_combo.configure(values=tuple(self._ui_mode_label(key) for key in UI_MODE_KEYS))
             self.ui_mode_var.set(self._ui_mode_label(self.settings.ui_mode))
+        if hasattr(self, "theme_combo"):
+            self.theme_combo.configure(values=tuple(self._theme_label(key) for key in THEME_KEYS))
+            self.theme_var.set(self._theme_label(self.settings.theme))
         self._update_summary()
 
     def _change_language(self) -> None:
@@ -396,8 +535,9 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         self._save_settings_quietly()
 
     def _change_theme(self) -> None:
-        self.settings.theme = self.theme_var.get()
+        self.settings.theme = self._current_theme_key()
         apply_theme(self, self.settings)
+        self._apply_theme_colors()
         self._save_settings_quietly()
 
     def _ui_mode_label(self, key: str) -> str:
@@ -429,14 +569,14 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
                 button.grid()
 
     def _browse_source(self) -> None:
-        folder = filedialog.askdirectory(title=self.i18n.gettext("path.source"))
+        folder = filedialog.askdirectory(title=self.i18n.gettext("path.source"), initialdir=_existing_dir(self.source_var.get()))
         if folder:
             self.source_var.set(folder)
             self.settings.last_source_path = folder
             self._save_settings_quietly()
 
     def _browse_output(self) -> None:
-        folder = filedialog.askdirectory(title=self.i18n.gettext("path.output"))
+        folder = filedialog.askdirectory(title=self.i18n.gettext("path.output"), initialdir=_existing_dir(self.output_var.get()))
         if folder:
             self.output_var.set(folder)
             self.settings.last_output_path = folder
@@ -490,7 +630,14 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
                 self.events.put(("log", self.i18n.gettext("message.cancel_requested")))
                 self.events.put(("auto_config_cancelled", None))
                 return
-            metadata_items = MetadataReader().read_many(paths, validated, self.cancel_event, lambda done, total: self._worker_progress("Чтение метаданных", done, total))
+            metadata_items = MetadataReader.from_settings(self.settings).read_many(
+                paths,
+                validated,
+                self.cancel_event,
+                lambda done, total: self._worker_progress("Чтение метаданных", done, total),
+                self.settings,
+                exif_progress=lambda done, total: self._worker_progress("Чтение EXIF", done, total),
+            )
             report = self._build_auto_config_report(metadata_items)
             self.events.put(("auto_config_ready", report))
         except Exception as exc:
@@ -608,7 +755,11 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         body = ttk.Frame(dialog, padding=16)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text=self.i18n.gettext("move.warning"), wraplength=460, justify="left").pack(anchor="w")
-        ttk.Label(body, text=f"{len(plan.operations)} files, {_format_size(plan.total_bytes)}", justify="left").pack(anchor="w", pady=(8, 0))
+        ttk.Label(
+            body,
+            text=self.i18n.gettext("move.summary", count=len(plan.operations), size=_format_size(plan.total_bytes)),
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
         ttk.Label(body, text=str(plan.output_root), wraplength=460, justify="left").pack(anchor="w", pady=(4, 8))
         ttk.Checkbutton(body, text=self.i18n.gettext("move.checkbox"), variable=understood).pack(anchor="w", pady=(4, 8))
         buttons = ttk.Frame(body)
@@ -902,10 +1053,15 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
                 exc, loading_dialog = payload
                 loading_dialog.destroy()
                 self._handle_error(exc)
+            elif event == "preview_ready":
+                self._on_preview_ready(*payload)
             elif event == "undo_move_ready":
                 entry, result, on_done = payload
                 self._set_busy(False)
                 self._on_undo_move_done(entry, result, on_done)
+            elif event == "undo_move_blocked":
+                self._set_busy(False)
+                messagebox.showwarning(APP_NAME, self.i18n.gettext("history.undo_blocked") + "\n" + "\n".join(payload))
             elif event == "error":
                 self._set_busy(False)
                 self._handle_error(payload)
@@ -958,9 +1114,22 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
             messagebox.showinfo(APP_NAME, "\n".join(summary))
 
     def _set_progress(self, phase: str, done: int, total: int) -> None:
-        self.status_var.set(phase)
+        label = self._phase_label(phase)
+        if total > 1:
+            label = f"{label} \u00b7 {min(done, total)} / {total}"
+        self.status_var.set(label)
         self.progress["maximum"] = max(total, 1)
         self.progress["value"] = min(done, max(total, 1))
+
+    def _phase_label(self, phase: str) -> str:
+        """Translate a worker phase name; unknown phases are shown verbatim."""
+        key = PHASE_KEYS.get(phase)
+        if key:
+            return self.i18n.gettext(key)
+        for prefix, prefix_key in PHASE_KEYS.items():
+            if phase.startswith(prefix + " "):
+                return f"{self.i18n.gettext(prefix_key)} {phase[len(prefix) + 1:]}"
+        return phase
 
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
@@ -1029,8 +1198,9 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
                 "end",
                 iid=str(index),
                 text=display_name,
+                tags=(self._row_tag(file),),
                 values=(
-                    "yes" if file.selected else "no",
+                    "\u2713" if file.selected else "",
                     self._type_icon(file),
                     self.i18n.category(file.destination_category),
                     f"{file.confidence:.0f}%",
@@ -1120,17 +1290,65 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
             return
         file = files[0]
         token = self.gui_state.next_preview_token()
+        self._render_file_details(file)
         # Goes through PreviewCache so preview_cache_items actually bounds anything;
         # re-selecting a file no longer re-decodes it.
-        image, error = self._cached_tk_preview(file.metadata.source_path)
+        cache = self._preview_cache()
+        path = file.metadata.source_path
+        size = self.settings.thumbnail_size
+        cached = cache.peek(path, size)
+        if cached is not None:
+            self._show_preview(cached)
+            return
+        # Decoding (Pillow, or an ExifTool subprocess for RAW/DNG) runs off the
+        # GUI thread; the token drops results for a file no longer selected.
+        self.preview_image = None
+        self.preview_label.configure(image="", text=self.i18n.gettext("preview.loading"))
+        exiftool = self._preview_exiftool()
+
+        def decode() -> None:
+            info = load_preview_info(path, max_size=size, exiftool=exiftool)
+            self.events.put(("preview_ready", (token, info, size)))
+
+        threading.Thread(target=decode, name="preview-decode", daemon=True).start()
+
+    def _on_preview_ready(self, token: int, info: PreviewInfo, size: int | None = None) -> None:
+        self._preview_cache().put(info, size if size is not None else self.settings.thumbnail_size)
         if token != self.gui_state.preview_token:
             return
+        self._show_preview(info)
+
+    def _show_preview(self, info: PreviewInfo) -> None:
+        image = None
+        error = info.message
+        if info.available and info.image is not None:
+            try:
+                from PIL import ImageTk
+
+                image = ImageTk.PhotoImage(info.image)
+            except Exception as exc:
+                error = f"Preview unavailable: {exc}"
         self.preview_image = image
         if image is not None:
             self.preview_label.configure(image=image, text="")
         else:
-            message = error or self.i18n.gettext("preview.unavailable")
-            self.preview_label.configure(image="", text=message)
+            self.preview_label.configure(image="", text=error or self.i18n.gettext("preview.unavailable"))
+
+    def _preview_cache(self) -> PreviewCache:
+        """The cache sized by preview_cache_items; rebuilt when that setting changes."""
+        if self.preview_cache.max_items != max(1, self.settings.preview_cache_items):
+            self.preview_cache = PreviewCache(self.settings.preview_cache_items)
+        return self.preview_cache
+
+    def _preview_exiftool(self) -> ExifToolRunner:
+        runner = getattr(self, "_preview_runner", None)
+        if runner is None or getattr(self, "_preview_runner_path", None) != self.settings.exiftool_path:
+            runner = ExifToolRunner.from_settings(self.settings)
+            self._preview_runner = runner
+            self._preview_runner_path = self.settings.exiftool_path
+        return runner
+
+    def _render_file_details(self, file: PhotoFile) -> None:
         self.preview_details.configure(
             text="\n".join(
                 [
@@ -1166,20 +1384,6 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         self.reasons_text.delete("1.0", tk.END)
         self.reasons_text.insert("1.0", "\n".join(reason_lines))
 
-    def _cached_tk_preview(self, path: Path):
-        """Decode a preview at most once per path, honouring preview_cache_items."""
-        if self.preview_cache.max_items != max(1, self.settings.preview_cache_items):
-            self.preview_cache = PreviewCache(self.settings.preview_cache_items)
-        info = self.preview_cache.get(path, self.settings.thumbnail_size)
-        if not info.available or info.image is None:
-            return None, info.message
-        try:
-            from PIL import ImageTk
-
-            return ImageTk.PhotoImage(info.image), None
-        except Exception as exc:
-            return None, f"Preview unavailable: {exc}"
-
     def _show_context_menu(self, event) -> None:
         row = self.tree.identify_row(event.y)
         if row:
@@ -1194,9 +1398,9 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         menu.add_command(label=self.i18n.category(DestinationCategory.SKIP), command=lambda: self._assign_selected(DestinationCategory.SKIP))
         menu.add_command(label=self.i18n.category(DestinationCategory.REVIEW), command=lambda: self._assign_selected(DestinationCategory.REVIEW))
         menu.add_separator()
-        menu.add_command(label="Create HDR 3", command=lambda: self._manual_series(3))
-        menu.add_command(label="Create HDR 5", command=lambda: self._manual_series(5))
-        menu.add_command(label="Dissolve series", command=self._dissolve_series)
+        menu.add_command(label=self.i18n.gettext("menu.create_hdr3"), command=lambda: self._manual_series(3))
+        menu.add_command(label=self.i18n.gettext("menu.create_hdr5"), command=lambda: self._manual_series(5))
+        menu.add_command(label=self.i18n.gettext("menu.dissolve_series"), command=self._dissolve_series)
         menu.add_command(label=self.i18n.gettext("action.undo"), command=self._undo)
         menu.add_command(label=self.i18n.gettext("action.redo"), command=self._redo)
         menu.tk_popup(event.x_root, event.y_root)
@@ -1720,14 +1924,17 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         body = ttk.Frame(dialog, padding=12)
         body.pack(fill="both", expand=True)
 
+        table = ttk.Frame(body)
+        table.pack(fill="both", expand=True, side="top")
         columns = ("reason", "summary")
-        tree = ttk.Treeview(body, columns=columns, show="headings", selectmode="browse")
+        tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse")
         tree.heading("reason", text=self.i18n.gettext("review_queue.column.reason"))
         tree.heading("summary", text=self.i18n.gettext("review_queue.column.summary"))
         tree.column("reason", width=180, anchor="w")
         tree.column("summary", width=560, anchor="w")
-        tree.pack(fill="both", expand=True, side="top")
-        scroll = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        scroll = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
+        scroll.pack(fill="y", side="right")
+        tree.pack(fill="both", expand=True, side="left")
         tree.configure(yscrollcommand=scroll.set)
 
         items_by_iid: dict[str, ReviewItem] = {}
@@ -1849,8 +2056,10 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         body = ttk.Frame(dialog, padding=12)
         body.pack(fill="both", expand=True)
 
+        table = ttk.Frame(body)
+        table.pack(fill="both", expand=True, side="top")
         columns = ("date", "type", "files", "status")
-        tree = ttk.Treeview(body, columns=columns, show="headings", selectmode="browse")
+        tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse")
         tree.heading("date", text=self.i18n.gettext("history.column.date"))
         tree.heading("type", text=self.i18n.gettext("history.column.type"))
         tree.heading("files", text=self.i18n.gettext("history.column.files"))
@@ -1859,8 +2068,9 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         tree.column("type", width=150, anchor="w")
         tree.column("files", width=80, anchor="center")
         tree.column("status", width=140, anchor="w")
-        tree.pack(fill="both", expand=True, side="top")
-        scroll = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        scroll = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
+        scroll.pack(fill="y", side="right")
+        tree.pack(fill="both", expand=True, side="left")
         tree.configure(yscrollcommand=scroll.set)
 
         entries_by_iid: dict[str, object] = {}
@@ -1896,7 +2106,9 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
             if entry is None:
                 messagebox.showinfo(APP_NAME, self.i18n.gettext("history.select_item"))
                 return
-            ok, reasons = can_undo_move(entry)
+            # Quick check only (no hashing) on the GUI thread; the worker repeats
+            # it with SHA-256 verification before touching anything.
+            ok, reasons = can_undo_move(entry, verify_hashes=False)
             if not ok:
                 messagebox.showwarning(APP_NAME, self.i18n.gettext("history.undo_blocked") + "\n" + "\n".join(reasons))
                 return
@@ -1949,6 +2161,11 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
 
     def _undo_move_worker(self, entry, on_done) -> None:
         try:
+            self._worker_progress("Восстановление", 0, 1)
+            ok, reasons = can_undo_move(entry)
+            if not ok:
+                self.events.put(("undo_move_blocked", reasons))
+                return
             result = undo_move(entry, self.cancel_event, self._worker_progress)
             self.events.put(("undo_move_ready", (entry, result, on_done)))
         except Exception as exc:
@@ -1958,7 +2175,9 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
         try:
             undo_entry = build_journal_entry(result, Path(entry.source_root))
             append_journal_entry(undo_entry, self.journal_path)
-            if result.copied_files and not result.errors:
+            # A cancelled undo leaves files in the output folder; the entry must
+            # stay undoable so the user can resume it later.
+            if result.copied_files and not result.errors and not result.cancelled:
                 mark_undone(entry.entry_id, undo_entry.entry_id, self.journal_path)
         except Exception as exc:
             self._log(f"Journal: {exc}")
@@ -2007,10 +2226,10 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
             self._open_path(str(self.last_result_root))
 
     def _exiftool_status(self) -> str:
-        version = ExifToolRunner().version()
+        version = ExifToolRunner.from_settings(self.settings).version()
         if version:
             return f"ExifTool {version}"
-        return "ExifTool fallback mode"
+        return self.i18n.gettext("top.exiftool_fallback")
 
     def _current_filter_key(self) -> str:
         label = self.filter_var.get()
@@ -2021,6 +2240,23 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
 
     def _filter_label(self, key: str) -> str:
         return self.i18n.gettext(f"filter.{key}")
+
+    def _row_tag(self, file: PhotoFile) -> str:
+        if file.metadata.metadata_errors or file.copy_error:
+            return "error"
+        category = file.destination_category
+        if category is DestinationCategory.REVIEW:
+            return "review"
+        if category is DestinationCategory.SKIP or not file.selected:
+            return "skip"
+        if category in {
+            DestinationCategory.BRACKETING_3,
+            DestinationCategory.BRACKETING_5,
+            DestinationCategory.BRACKETING_7,
+            DestinationCategory.BRACKETING_9,
+        }:
+            return "series"
+        return ""
 
     def _type_icon(self, file: PhotoFile) -> str:
         if file.destination_category is DestinationCategory.BRACKETING_3:
@@ -2052,6 +2288,15 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
             return
 
     def _on_close(self) -> None:
+        if self.worker and self.worker.is_alive():
+            # Closing mid-Move used to kill the daemon thread outright: no
+            # report, no journal entry for the originals already deleted.
+            if not messagebox.askyesno(APP_NAME, self.i18n.gettext("message.close_while_busy")):
+                return
+            self.cancel_event.set()
+            self.status_var.set(self.i18n.gettext("message.cancel_requested"))
+            self.update_idletasks()
+            self.worker.join(timeout=60)
         if self.settings.remember_window:
             self.settings.window_geometry = self.geometry()
         self._capture_column_layout()
@@ -2061,6 +2306,56 @@ class MainWindow(DialogsMixin, SettingsViewMixin, tk.Tk):
     def _log(self, text: str) -> None:
         self.log_text.insert(tk.END, text + "\n")
         self.log_text.see(tk.END)
+
+
+def _load_settings_or_defaults(path: Path) -> tuple[AppSettings, str | None]:
+    """Load settings, or fall back to defaults when the file is unreadable.
+
+    A hand-edited or truncated settings.json used to raise straight out of
+    MainWindow.__init__, which left the user with no window and (in the
+    windowed build) no error either. The problem is returned so the window
+    can show it once it exists; the broken file is left in place untouched.
+    """
+    try:
+        return load_settings(path), None
+    except (SettingsError, ValueError, TypeError, OSError) as exc:
+        reason = exc.user_message if isinstance(exc, PhotoBracketSorterError) else str(exc)
+        return AppSettings(), reason
+
+
+def _existing_dir(value: str) -> str | None:
+    """The folder a file dialog should open in: the entry's value when it exists."""
+    text = value.strip()
+    if not text:
+        return None
+    path = Path(text)
+    if path.is_dir():
+        return str(path)
+    return str(path.parent) if path.parent.is_dir() else None
+
+
+def clamp_geometry(geometry: str, screen_width: int, screen_height: int, margin: int = 40) -> str:
+    """Fit a Tk geometry string (``WxH`` or ``WxH+X+Y``) onto a screen.
+
+    Width and height are capped at the screen minus ``margin``; an offset
+    that would leave less than ``margin`` pixels of the window visible is
+    dropped so the window manager places it. Unparseable input is returned
+    unchanged so Tk can reject it on its own terms.
+    """
+    import re
+
+    match = re.fullmatch(r"(\d+)x(\d+)(?:([+-]\d+)([+-]\d+))?", geometry.strip())
+    if not match or screen_width <= 0 or screen_height <= 0:
+        return geometry
+    width = min(int(match.group(1)), max(1, screen_width - margin))
+    height = min(int(match.group(2)), max(1, screen_height - margin))
+    result = f"{width}x{height}"
+    if match.group(3) is not None and match.group(4) is not None:
+        x_offset = int(match.group(3))
+        y_offset = int(match.group(4))
+        if -width + margin <= x_offset <= screen_width - margin and 0 <= y_offset <= screen_height - margin:
+            result += f"{x_offset:+d}{y_offset:+d}"
+    return result
 
 
 def _format_suggestion_value(value: Any) -> str:

@@ -1,4 +1,4 @@
-Photo Bracket Sorter 1.1.0
+Photo Bracket Sorter 1.2.1
 
 1. Распакуйте ZIP в новую пустую папку.
 2. Запустите PhotoBracketSorter.exe.

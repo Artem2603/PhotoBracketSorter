@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 from pathlib import Path
 
 
@@ -15,6 +17,23 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def force_unlink(path: Path) -> None:
+    """Delete a file even when it carries the Windows read-only attribute.
+
+    Cameras set that attribute for "protected" shots and ``shutil.copy2``
+    carries it onto the ``.partial`` copy, so a plain ``unlink`` fails with
+    PermissionError on Windows. Missing files raise FileNotFoundError as usual.
+    """
+    try:
+        path.unlink()
+    except PermissionError:
+        try:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+        path.unlink()
 
 
 def quick_fingerprint(path: Path, chunk_size: int = 64 * 1024) -> str:

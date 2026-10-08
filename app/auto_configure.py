@@ -37,6 +37,24 @@ _SUBSECOND_TAGS = ("SubSecDateTimeOriginal", "SubSecCreateDate", "SubSecTimeOrig
 #: more than this fraction — otherwise the dialog fills with no-op rows.
 _RELATIVE_CHANGE_THRESHOLD = 0.08
 
+#: Discovery only counts a cluster as bracket evidence when its frames span at
+#: least this much exposure. The smallest bracket increment cameras offer is
+#: 1/3 EV, so even a three-frame bracket spans about 0.67 EV, while
+#: auto-exposure drift inside a plain burst rarely exceeds about 0.4 EV; 0.5 EV
+#: sits between the two. See :func:`_discovery_min_span_ev` for how it combines
+#: with the user's own threshold.
+_DISCOVERY_MIN_SPAN_EV = 0.5
+
+#: Per-size duration limits that ``validate_settings`` requires to be at least
+#: ``max_bracket_adjacent_delta_seconds``.
+_DURATION_FIELDS = (
+    "max_bracket_duration_seconds_3",
+    "max_bracket_duration_seconds_5",
+    "max_bracket_duration_seconds_7",
+    "max_bracket_duration_seconds_9",
+)
+_ADJACENT_FIELD = "max_bracket_adjacent_delta_seconds"
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CameraSignature:
@@ -111,10 +129,11 @@ def analyze_for_suggestions(
         discovery_settings = _bracket_discovery_settings(settings)
         _candidates, detected = BracketDetector().detect(raw_files, discovery_settings)
         # The discovery profile widens time/duration windows so real brackets are
-        # never rejected on timing alone, but that also lets pure bursts (same
-        # exposure, just close together) through with a duration-only score. Only
-        # a cluster with observed exposure variation is evidence of a bracket, so
-        # timing-only matches are dropped before they can shape a suggestion.
+        # never rejected on timing alone, but that also lets bursts through with
+        # a timing-only score. Only a cluster whose exposure spans a meaningful
+        # range (the discovery min_exposure_span_ev, see _discovery_min_span_ev)
+        # is evidence of a bracket; flat bursts and auto-exposure drift are
+        # dropped before they can shape a suggestion.
         series_list = [series for series in detected if "BRACKET_EXPOSURE_SPAN_OK" in series.reasons]
         if not series_list:
             warnings.append(_text(language, "no_series"))
@@ -190,12 +209,38 @@ def apply_suggestions(
     if not changes:
         return settings
     updated = dataclasses.replace(settings, **changes)
-    if "max_bracket_duration_seconds_3" in changes or "max_bracket_duration_seconds_5" in changes:
-        updated = dataclasses.replace(
-            updated,
-            max_bracket_duration_seconds=max(updated.max_bracket_duration_seconds_3, updated.max_bracket_duration_seconds_5),
-        )
+    if _ADJACENT_FIELD in changes or any(field in changes for field in _DURATION_FIELDS):
+        updated = _reconcile_timing(updated, changes)
     return updated
+
+
+def _reconcile_timing(updated: AppSettings, changes: dict[str, Any]) -> AppSettings:
+    """Keep ``duration >= adjacent gap`` true whatever subset the user accepted.
+
+    ``validate_settings`` rejects any per-size duration below the adjacent
+    delta. The suggestions are consistent *as a set*, but the user may accept
+    only one side: a 0.6 s duration next to the old 1.2 s gap, or a widened
+    gap next to the old durations. An accepted duration wins — a gap between
+    two frames can never exceed the whole series — so the gap is lowered to
+    it; otherwise the untouched durations are raised to make room for the
+    accepted gap. Either way the result validates by construction instead of
+    failing later in the settings dialog.
+    """
+    fixes: dict[str, Any] = {}
+    adjacent = updated.max_bracket_adjacent_delta_seconds
+    accepted_durations = [getattr(updated, field) for field in _DURATION_FIELDS if field in changes]
+    if accepted_durations and adjacent > min(accepted_durations):
+        adjacent = min(accepted_durations)
+        fixes[_ADJACENT_FIELD] = adjacent
+    for field in _DURATION_FIELDS:
+        if getattr(updated, field) < adjacent:
+            fixes[field] = adjacent
+    if fixes:
+        updated = dataclasses.replace(updated, **fixes)
+    return dataclasses.replace(
+        updated,
+        max_bracket_duration_seconds=max(updated.max_bracket_duration_seconds_3, updated.max_bracket_duration_seconds_5),
+    )
 
 
 # --------------------------------------------------------------------- helpers
@@ -251,11 +296,24 @@ def _bracket_discovery_settings(settings: AppSettings) -> AppSettings:
         max_bracket_duration_seconds_3=max(settings.max_bracket_duration_seconds_3, 20.0),
         max_bracket_duration_seconds_5=max(settings.max_bracket_duration_seconds_5, 30.0),
         max_bracket_duration_seconds=max(settings.max_bracket_duration_seconds, 30.0),
-        min_exposure_span_ev=0.05,
+        min_exposure_span_ev=_discovery_min_span_ev(settings),
         exposure_step_tolerance=2.0,
         require_exposure_for_auto_series=False,
         min_auto_confidence=1.0,
     )
+
+
+def _discovery_min_span_ev(settings: AppSettings) -> float:
+    """The exposure span a discovered cluster must show to count as a bracket.
+
+    ``max(0.5 EV, half the user's min_exposure_span_ev)``, capped at the user's
+    own value: half, so a camera the current setting is too strict for still
+    surfaces and can be suggested; the 0.5 EV floor (see
+    ``_DISCOVERY_MIN_SPAN_EV``) so auto-exposure drift in a burst is never
+    mistaken for a bracket; and never above what the user already accepts.
+    """
+    user_min = settings.min_exposure_span_ev
+    return max(min(_DISCOVERY_MIN_SPAN_EV, user_min), user_min / 2)
 
 
 def _pairing_discovery_settings(settings: AppSettings) -> AppSettings:

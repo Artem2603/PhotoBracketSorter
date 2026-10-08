@@ -25,12 +25,14 @@ class Classifier:
         raw_files, rendered_files = split_raw_and_rendered(files)
         pairs = self.pair_matcher.match(raw_files, rendered_files, settings)
         candidates, series_list = self.bracket_detector.detect(raw_files, settings)
-        self._connect_series_companions(series_list, pairs, settings)
+        self._connect_series_companions(series_list, pairs)
         # SeriesManager owns destination layout for series members, so automatic and
         # manual series land in exactly the same place by exactly the same rules.
-        self.series_manager = SeriesManager(series_list)
+        # It also owns the one place where ``store_companions_inside_series`` is
+        # honoured, so the setting cannot silently stop working again.
+        self.series_manager = SeriesManager(series_list, store_companions_inside_series=settings.store_companions_inside_series)
         self.series_manager.sync_destinations()
-        self._apply_series_confidence(series_list)
+        self._apply_series_confidence(series_list, settings)
         self._apply_default_destinations(files)
         # Informational only (feature 8): labels PhotoFile.group_classification
         # without touching destination_category, which the lines above already
@@ -68,24 +70,30 @@ class Classifier:
             file.confidence_level = ConfidenceLevel.MEDIUM
             file.decision_reasons.append("RAW_FORMAT")
 
-    def _connect_series_companions(self, series_list: list[BracketSeries], pairs: list[RawHeicPair], settings: AppSettings) -> None:
+    def _connect_series_companions(self, series_list: list[BracketSeries], pairs: list[RawHeicPair]) -> None:
+        """Record which rendered file pairs with each series RAW.
+
+        Only the relation is recorded here; whether a companion is *placed*
+        inside the series folder is decided by SeriesManager.sync_destinations
+        from ``store_companions_inside_series``.
+        """
         pair_by_raw = {pair.raw_file.metadata.source_path.resolve(): pair for pair in pairs}
         for series in series_list:
             companions: dict[str, PhotoFile | None] = {}
             for raw_file in series.raw_files:
                 pair = pair_by_raw.get(raw_file.metadata.source_path.resolve())
                 companions[raw_file.metadata.file_name] = pair.rendered_file if pair else None
-                if pair and settings.store_companions_inside_series:
-                    pair.rendered_file.series_id = series.series_id
             series.rendered_companions = companions
 
-    def _apply_series_confidence(self, series_list: list[BracketSeries]) -> None:
+    def _apply_series_confidence(self, series_list: list[BracketSeries], settings: AppSettings) -> None:
         """Score members of automatic series. Paths are already set by SeriesManager."""
         for series in series_list:
             for raw_file in series.raw_files:
                 raw_file.confidence = series.confidence
                 raw_file.confidence_level = series.confidence_level
                 raw_file.decision_reasons.extend(series.reasons)
+            if not settings.store_companions_inside_series:
+                continue  # companions stay plain HEIC/ files; nothing about them changed
             for companion in series.rendered_companions.values():
                 if companion is not None:
                     companion.confidence = min(companion.confidence + 10.0, 95.0)

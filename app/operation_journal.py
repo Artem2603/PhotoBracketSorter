@@ -35,8 +35,8 @@ from pathlib import Path
 from typing import Callable
 
 from app.enums import OperationStatus
-from app.errors import CopyVerificationError, InsufficientSpaceError, MoveCancelled
-from app.integrity import sha256_file
+from app.errors import CopyVerificationError, InsufficientSpaceError
+from app.integrity import force_unlink, sha256_file
 from app.models import CopyOperation, CopyResult
 
 #: How many runs to keep. Old entries are dropped, oldest first, never silently
@@ -125,30 +125,51 @@ def journal_path() -> Path:
 
 
 def load_journal(path: Path | None = None) -> list[JournalEntry]:
-    journal_file = path or journal_path()
+    """Read the journal; never raises. A damaged entry is skipped, a damaged file reads as empty."""
+    return _read_journal(path or journal_path())[0]
+
+
+def _read_journal(journal_file: Path) -> tuple[list[JournalEntry], bool]:
+    """Return ``(entries, file_is_damaged)``.
+
+    The flag lets writers set a damaged file aside instead of overwriting it:
+    the history is the only record of which originals a Move deleted.
+    """
     if not journal_file.exists():
-        return []
+        return [], False
     try:
-        data = json.loads(journal_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
+        data = json.loads(journal_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return [], True
     if not isinstance(data, list):
-        return []
+        return [], True
     entries = []
     for item in data:
         if isinstance(item, dict):
             try:
                 entries.append(JournalEntry.from_dict(item))
-            except TypeError:
+            except Exception:
                 continue
-    return entries
+    return entries, False
+
+
+def _set_aside_damaged(journal_file: Path) -> None:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        journal_file.replace(journal_file.with_name(f"{journal_file.name}.broken-{stamp}"))
+    except OSError:
+        pass
 
 
 def save_journal(entries: list[JournalEntry], path: Path | None = None) -> None:
     journal_file = path or journal_path()
     journal_file.parent.mkdir(parents=True, exist_ok=True)
     trimmed = entries[-MAX_JOURNAL_ENTRIES:]
-    journal_file.write_text(json.dumps([entry.to_dict() for entry in trimmed], ensure_ascii=False, indent=2), encoding="utf-8")
+    text = json.dumps([entry.to_dict() for entry in trimmed], ensure_ascii=False, indent=2)
+    # Write-then-rename so a crash mid-write cannot truncate the history.
+    partial = journal_file.with_name(journal_file.name + ".partial")
+    partial.write_text(text, encoding="utf-8")
+    os.replace(partial, journal_file)
 
 
 def build_journal_entry(result: CopyResult, source_root: Path) -> JournalEntry:
@@ -167,26 +188,43 @@ def build_journal_entry(result: CopyResult, source_root: Path) -> JournalEntry:
 
 
 def append_journal_entry(entry: JournalEntry, path: Path | None = None) -> None:
-    entries = load_journal(path)
+    journal_file = path or journal_path()
+    entries, damaged = _read_journal(journal_file)
+    if damaged:
+        _set_aside_damaged(journal_file)
     entries.append(entry)
-    save_journal(entries, path)
+    save_journal(entries, journal_file)
 
 
 def mark_undone(entry_id: str, undo_entry_id: str, path: Path | None = None) -> None:
-    entries = load_journal(path)
+    journal_file = path or journal_path()
+    entries, damaged = _read_journal(journal_file)
+    if damaged:
+        _set_aside_damaged(journal_file)
     for entry in entries:
         if entry.entry_id == entry_id:
             entry.undone = True
             entry.undo_entry_id = undo_entry_id
             break
-    save_journal(entries, path)
+    save_journal(entries, journal_file)
 
 
 # --------------------------------------------------------------------- undo
 
 
-def can_undo_move(entry: JournalEntry) -> tuple[bool, list[str]]:
-    """Check every precondition without moving anything. Never raises."""
+def _already_restored(record: OperationRecord) -> bool:
+    """True when an earlier (cancelled) undo of this entry already put this file back."""
+    return not Path(record.destination_path).exists() and Path(record.source_path).exists()
+
+
+def can_undo_move(entry: JournalEntry, verify_hashes: bool = True) -> tuple[bool, list[str]]:
+    """Check every precondition without moving anything. Never raises.
+
+    ``verify_hashes=False`` skips the SHA-256 pass (which reads every moved
+    file) so a GUI can run a quick check on its main thread and leave the full
+    verification to the worker. Files an earlier, cancelled undo already
+    restored are not blockers: the remaining files can still be undone.
+    """
     reasons: list[str] = []
     if entry.operation_type != "move":
         return False, ["Эта запись не является перемещением."]
@@ -195,16 +233,29 @@ def can_undo_move(entry: JournalEntry) -> tuple[bool, list[str]]:
     completed = [record for record in entry.records if record.status == OperationStatus.COMPLETED.value and record.source_deleted]
     if not completed:
         return False, ["Нет успешно перемещённых файлов для отмены."]
+    remaining = 0
     for record in completed:
         destination = Path(record.destination_path)
         source = Path(record.source_path)
+        if _already_restored(record):
+            continue
         if not destination.exists():
             reasons.append(f"{destination.name}: файл результата отсутствует.")
             continue
         if source.exists():
             reasons.append(f"{source.name}: исходный путь уже занят.")
             continue
-        if record.sha256_destination:
+        try:
+            current_size = destination.stat().st_size
+        except OSError as exc:
+            reasons.append(f"{destination.name}: не удалось прочитать файл ({exc}).")
+            continue
+        # Size is checked even without a recorded hash (verify_sha256 off), so
+        # undo never copies a foreign file over the original's path blindly.
+        if current_size != record.expected_size:
+            reasons.append(f"{destination.name}: содержимое изменилось после перемещения (размер не совпадает).")
+            continue
+        if verify_hashes and record.sha256_destination:
             try:
                 current_hash = sha256_file(destination)
             except OSError as exc:
@@ -212,6 +263,10 @@ def can_undo_move(entry: JournalEntry) -> tuple[bool, list[str]]:
                 continue
             if current_hash != record.sha256_destination:
                 reasons.append(f"{destination.name}: содержимое изменилось после перемещения.")
+                continue
+        remaining += 1
+    if not reasons and remaining == 0:
+        return False, ["Все файлы этого перемещения уже восстановлены."]
     return not reasons, reasons
 
 
@@ -237,6 +292,7 @@ def undo_move(
     operations = [_operation_for(record, OperationStatus.PENDING) for record in completed]
     restored = 0
     errors = 0
+    already = 0
     cancelled = False
     for index, (record, operation) in enumerate(zip(completed, operations), start=1):
         if cancel_event.is_set():
@@ -244,6 +300,11 @@ def undo_move(
             break
         if progress:
             progress("Восстановление", index, total)
+        if _already_restored(record):
+            # Put back by an earlier undo that was cancelled part-way.
+            operation.status = OperationStatus.SKIPPED
+            already += 1
+            continue
         operation.status = OperationStatus.RUNNING
         try:
             _restore_one(record)
@@ -270,7 +331,7 @@ def undo_move(
         finished_at=datetime.now(),
         operation="undo_move",
         deleted_sources=restored,  # the destination copy is removed once restored
-        skipped_files=skipped,
+        skipped_files=skipped + already,
     )
 
 
@@ -297,29 +358,34 @@ def _restore_one(record: OperationRecord) -> None:
         raise FileNotFoundError(f"Файл результата отсутствует: {destination_now}")
     if original_source.exists():
         raise CopyVerificationError("Исходный путь уже занят.", str(original_source))
+    current_size = destination_now.stat().st_size
+    if current_size != record.expected_size:
+        raise CopyVerificationError("Содержимое изменилось после перемещения (размер не совпадает).", str(destination_now))
     if record.sha256_destination:
         current_hash = sha256_file(destination_now)
         if current_hash != record.sha256_destination:
             raise CopyVerificationError("Содержимое изменилось после перемещения.", str(destination_now))
 
-    current_size = destination_now.stat().st_size
     original_source.parent.mkdir(parents=True, exist_ok=True)
     partial = original_source.with_name(original_source.name + ".partial")
     if partial.exists():
-        partial.unlink()
+        force_unlink(partial)
 
     usage = shutil.disk_usage(original_source.parent)
     if usage.free < current_size:
         raise InsufficientSpaceError(technical_reason=f"Нужно {current_size} байт, свободно {usage.free} байт.")
 
-    shutil.copy2(destination_now, partial)
-    if partial.stat().st_size != current_size:
-        partial.unlink()
-        raise CopyVerificationError("Размер восстановленной копии не совпадает.", str(original_source))
-    if record.sha256_destination:
-        restored_hash = sha256_file(partial)
-        if restored_hash != record.sha256_destination:
-            partial.unlink()
-            raise CopyVerificationError("SHA-256 восстановленной копии не совпадает.", str(original_source))
-    os.replace(partial, original_source)
-    destination_now.unlink()
+    try:
+        shutil.copy2(destination_now, partial)
+        if partial.stat().st_size != current_size:
+            raise CopyVerificationError("Размер восстановленной копии не совпадает.", str(original_source))
+        if record.sha256_destination:
+            restored_hash = sha256_file(partial)
+            if restored_hash != record.sha256_destination:
+                raise CopyVerificationError("SHA-256 восстановленной копии не совпадает.", str(original_source))
+        os.replace(partial, original_source)
+    except BaseException:
+        if partial.exists():
+            force_unlink(partial)
+        raise
+    force_unlink(destination_now)

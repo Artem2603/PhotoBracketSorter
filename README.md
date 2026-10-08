@@ -1,10 +1,11 @@
-# Photo Bracket Sorter 1.1.0
+# Photo Bracket Sorter 1.2.1
 
 Windows portable app for sorting smartphone photo folders with rendered files, RAW files, and 3/5-frame bracketing series.
 
 ## What It Does
 
 - Finds HEIC/HEIF/HIF/JPEG/PNG, DNG and common RAW formats.
+- Optional: install `pillow-heif` to get full HEIC previews in the GUI; without it the embedded thumbnail is shown when one exists.
 - Uses bundled ExifTool 13.59 when available; fallback mode is only for emergencies and is less accurate.
 - Matches RAW + HEIC/JPEG companions.
 - Detects independent `BRACKETING_3` and `BRACKETING_5` series.
@@ -21,7 +22,9 @@ If a file is copied but the source cannot be deleted, the operation is marked `D
 
 ## GUI
 
-Version 1.1.0 adds a modern Tk/ttkbootstrap interface with Russian and English languages, light/dark/system themes, separate Copy and Move buttons, preview tabs, settings migration, filters, sorting and manual review helpers.
+A Tk/ttkbootstrap interface with Russian and English languages, light/dark/system themes (system follows the Windows app theme), colour-coded Copy and Move buttons, clickable summary cards that filter the table, rows coloured by outcome, embedded RAW/DNG previews decoded off the GUI thread, preview tabs, settings with human-readable labels, filters, sorting and manual review helpers.
+
+See `CHANGELOG.md` for what changed in each version.
 
 ## Limits Of Verification
 

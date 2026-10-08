@@ -9,6 +9,7 @@ from pathlib import Path
 from app.collision_handling import unique_destination
 from app.constants import MAIN_OUTPUT_DIRS
 from app.enums import DestinationCategory
+from app.errors import DestinationCollisionError
 from app.models import AnalysisResult, AppSettings, CopyOperation, CopyPlan
 from app.paths import make_unique_output_root, validate_output_parent
 
@@ -33,10 +34,19 @@ def _apply_subfolders(file, settings: AppSettings) -> Path:
 def resolve_destination(base_path: Path, reserved: set[Path], behavior: str) -> Path | None:
     """Apply the duplicate_behavior policy to a destination collision.
 
-    ``rename`` picks a free ``name_02`` variant, ``overwrite`` reuses the path, and
-    ``skip`` returns ``None`` so the caller drops the operation.
+    ``rename`` picks a free ``name_02`` variant, ``overwrite`` reuses a path that
+    already exists *on disk*, and ``skip`` returns ``None`` so the caller drops
+    the operation.
+
+    ``overwrite`` never reuses a path another operation of the *same plan* has
+    already claimed: two same-named sources (``100APPLE/IMG_0001.JPG`` and
+    ``101APPLE/IMG_0001.JPG``) would otherwise be written to one destination,
+    and in Move mode the first source is deleted after its copy is overwritten
+    by the second — the photo is gone. Such collisions get a unique name.
     """
     if behavior == "overwrite":
+        if base_path in reserved:
+            return unique_destination(base_path, reserved)
         reserved.add(base_path)
         return base_path
     if behavior == "skip":
@@ -66,6 +76,7 @@ def build_copy_plan(
     operations: list[CopyOperation] = []
     unresolved_review = 0
     skipped_duplicates = 0
+    skipped_names: list[str] = []
     warnings: list[str] = []
     for file in analysis.files:
         if file.destination_category in {DestinationCategory.REVIEW, DestinationCategory.SKIP}:
@@ -78,6 +89,7 @@ def build_copy_plan(
         destination = resolve_destination(output_root / subpath, reserved, settings.duplicate_behavior)
         if destination is None:
             skipped_duplicates += 1
+            skipped_names.append(file.metadata.relative_path.as_posix())
             continue
         operations.append(
             CopyOperation(
@@ -99,9 +111,20 @@ def build_copy_plan(
     if unresolved_review:
         warnings.append(f"Файлов для проверки: {unresolved_review}. Они не будут скопированы автоматически.")
     if skipped_duplicates:
-        warnings.append(f"Пропущено существующих файлов: {skipped_duplicates} (режим дубликатов «skip»).")
+        shown = ", ".join(skipped_names[:5]) + ("…" if len(skipped_names) > 5 else "")
+        warnings.append(
+            f"Пропущено файлов с совпадающими именами: {skipped_duplicates} (режим дубликатов «skip»). "
+            f"Они не будут скопированы: {shown}"
+        )
     if settings.duplicate_behavior == "overwrite":
-        warnings.append("Режим дубликатов «overwrite»: существующие файлы в папке результата будут перезаписаны.")
+        warnings.append(
+            "Режим дубликатов «overwrite»: существующие файлы в папке результата будут перезаписаны. "
+            "Одинаковые имена внутри этого запуска получают суффикс _02, _03…"
+        )
+    destinations = [operation.destination_path for operation in operations]
+    if len(set(destinations)) != len(destinations):
+        # Defensive: no policy may ever let two operations share a destination.
+        raise DestinationCollisionError(technical_reason="План содержит две операции с одинаковым путём назначения.")
     return CopyPlan(
         output_root=output_root,
         operations=tuple(operations),

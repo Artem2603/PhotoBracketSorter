@@ -8,9 +8,10 @@ from pathlib import Path
 
 from app.enums import CaptureTimeSource, ConfidenceLevel, DestinationCategory, DetectedType
 from app.errors import ManualSeriesError
-from app.models import AnalysisResult, AppSettings, BracketSeries, PhotoFile, PhotoMetadata, RawHeicPair
+from app.models import AnalysisResult, AppSettings, BracketCandidate, BracketSeries, PhotoFile, PhotoMetadata, RawHeicPair
 from app.review_queue import (
     DISMISS_NOT_BRACKET_MARKER,
+    NEAR_MISS_MIN_CONFIDENCE,
     SPLIT_KEEP_SINGLE_MARKER,
     ReviewReason,
     build_review_queue,
@@ -551,6 +552,198 @@ class ActionTests(unittest.TestCase):
         for file in files:
             self.assertIsNone(file.series_id)
             self.assertIn(SPLIT_KEEP_SINGLE_MARKER, file.decision_reasons)
+
+
+class RestoreAutomaticNumberingTests(unittest.TestCase):
+    """Regression: restore_automatic appended the detector's freshly numbered
+    HDR3_0001 next to the HDR3_0001 that already existed — same series_id, same
+    BRACKETING_3/Series_0001 folder, six RAW files in one directory."""
+
+    def _bracket(self, offset: int, minute: int) -> list[PhotoFile]:
+        shutters = (1 / 500, 1 / 125, 1 / 30)
+        return [
+            make_raw(
+                offset + index,
+                exposure_time=shutter,
+                exposure_compensation=0.0,
+                f_number=2.8,
+                iso=100,
+                capture_time=BASE_TIME + timedelta(minutes=minute, seconds=0.4 * index),
+            )
+            for index, shutter in enumerate(shutters)
+        ]
+
+    def test_restored_series_gets_a_unique_id_and_destination_folder(self):
+        from app.bracket_detection import BracketDetector
+
+        first = self._bracket(0, 0)
+        second = self._bracket(10, 60)
+        _candidates, automatic = BracketDetector().detect(first + second, AppSettings())
+        self.assertEqual(len(automatic), 2, "fixture must yield two automatic series")
+        manager = SeriesManager(automatic)
+        manager.sync_destinations()
+        manual = manager.create_manual(second, 3)  # the user re-groups the second one by hand
+        restored = restore_automatic(manager, manual, AppSettings())
+        self.assertIsNotNone(restored)
+        self.assertEqual(len(manager.series), 2)
+        ids = [series.series_id for series in manager.series]
+        roots = [series.destination_root for series in manager.series]
+        numbers = [series.series_number for series in manager.series]
+        self.assertEqual(len(set(ids)), 2, ids)
+        self.assertEqual(len(set(roots)), 2, roots)
+        self.assertEqual(len(set(numbers)), 2, numbers)
+        destinations = [file.destination_subpath for series in manager.series for file in series.raw_files]
+        self.assertEqual(len(set(destinations)), 6, destinations)
+        for file in restored.raw_files:
+            self.assertEqual(file.series_id, restored.series_id)
+
+
+class NearMissFloodTests(unittest.TestCase):
+    """Regression: a 20-frame flat burst produced 34 near-miss items (every sliding
+    3- and 5-frame window at confidence 40) that never cleared, even after the
+    user excluded the whole burst."""
+
+    def _flat_burst(self, count: int = 20) -> list[PhotoFile]:
+        return [
+            make_raw(index, exposure_compensation=0.0, exposure_time=1 / 125, f_number=2.8, iso=100, capture_time=BASE_TIME + timedelta(seconds=0.2 * index))
+            for index in range(count)
+        ]
+
+    def _bracketed_burst(self, count: int = 20) -> list[PhotoFile]:
+        # make_raw's default exposure_compensation cycles -1/0/+1, so every
+        # 3-frame window carries real exposure variation.
+        return [make_raw(index, capture_time=BASE_TIME + timedelta(seconds=0.2 * index)) for index in range(count)]
+
+    def _windows(self, files: list[PhotoFile], size: int, confidence: float, reasons: list[str] | None = None, first_id: int = 1) -> list[BracketCandidate]:
+        candidates = []
+        for start in range(len(files) - size + 1):
+            window = files[start : start + size]
+            candidates.append(
+                BracketCandidate(
+                    candidate_id=f"CAND_{first_id + start:04d}",
+                    files=window,
+                    candidate_size=size,
+                    start_time=window[0].metadata.capture_time,
+                    end_time=window[-1].metadata.capture_time,
+                    duration_seconds=0.2 * (size - 1),
+                    exposure_values=[],
+                    exposure_source="UNKNOWN",
+                    estimated_step_ev=None,
+                    score=confidence,
+                    confidence=confidence,
+                    reasons=list(reasons) if reasons is not None else ["BRACKET_DURATION_OK", "BRACKET_ADJACENT_TIME_OK"],
+                )
+            )
+        return candidates
+
+    def _near_miss(self, analysis: AnalysisResult, manager: SeriesManager) -> list:
+        return [item for item in build_review_queue(analysis, manager, AppSettings(), "ru") if item.reason is ReviewReason.NEAR_MISS_CANDIDATE]
+
+    def test_floor_is_the_low_confidence_boundary(self):
+        self.assertIs(ConfidenceLevel.from_score(NEAR_MISS_MIN_CONFIDENCE), ConfidenceLevel.LOW)
+        self.assertIs(ConfidenceLevel.from_score(NEAR_MISS_MIN_CONFIDENCE - 0.01), ConfidenceLevel.REVIEW)
+
+    def test_flat_burst_windows_below_the_floor_are_not_listed(self):
+        files = self._flat_burst()
+        candidates = self._windows(files, 3, 40.0) + self._windows(files, 5, 40.0, first_id=100)
+        self.assertEqual(len(candidates), 34)
+        self.assertEqual(self._near_miss(make_analysis(files, [], candidates=candidates), SeriesManager()), [])
+
+    def test_real_exposure_variation_keeps_a_low_confidence_candidate(self):
+        files = [make_raw(index) for index in range(3)]  # EC -1/0/+1: a bracket the detector rejected on timing
+        candidate = self._windows(files, 3, 22.0, reasons=["BRACKET_DURATION_OK"])[0]
+        items = self._near_miss(make_analysis(files, [], candidates=[candidate]), SeriesManager())
+        self.assertEqual([item.candidate_id for item in items], ["CAND_0001"])
+
+    def test_overlapping_windows_collapse_to_the_strongest_non_overlapping_ones(self):
+        files = self._bracketed_burst()
+        candidates = self._windows(files, 3, 50.0)
+        candidates[4].confidence = 60.0  # the strongest window must be among the chosen
+        items = self._near_miss(make_analysis(files, [], candidates=candidates), SeriesManager())
+        self.assertIn("CAND_0005", [item.candidate_id for item in items])
+        claimed: set[int] = set()
+        for item in items:
+            ids = {id(file) for file in item.files}
+            self.assertFalse(ids & claimed, "two near-miss items share a frame")
+            claimed |= ids
+        self.assertGreater(len(items), 1)
+        self.assertLessEqual(len(items), len(files) // 3)
+
+    def test_excluding_the_burst_clears_its_near_miss_items(self):
+        files = self._bracketed_burst()
+        analysis = make_analysis(files, [], candidates=self._windows(files, 3, 50.0))
+        manager = SeriesManager()
+        self.assertTrue(self._near_miss(analysis, manager))
+        exclude_files(files, manager)
+        self.assertEqual(self._near_miss(analysis, manager), [])
+
+    def test_a_manual_category_on_one_frame_retires_its_windows(self):
+        from app.manual_overrides import assign_category
+
+        files = [make_raw(index) for index in range(3)]
+        analysis = make_analysis(files, [], candidates=self._windows(files, 3, 60.0))
+        assign_category(files[1], DestinationCategory.RAW)
+        self.assertEqual(self._near_miss(analysis, SeriesManager()), [])
+
+    def test_real_classifier_flat_burst_does_not_flood_the_queue(self):
+        """The reviewer's trigger end to end: 20 flat frames 0.2 s apart through the real detector."""
+        from app.classification import build_analysis_result
+
+        metadata = [file.metadata for file in self._flat_burst()]
+        analysis = build_analysis_result(Path("C:/photos"), metadata, AppSettings(), "fp", BASE_TIME)
+        manager = SeriesManager.from_analysis(analysis)
+        self.assertEqual(self._near_miss(analysis, manager), [])
+        exclude_files(list(analysis.files), manager)
+        self.assertEqual(self._near_miss(analysis, manager), [])
+
+
+class AmbiguousPairClearingTests(unittest.TestCase):
+    """Regression: ambiguous items were collected from a warning substring alone, so
+    'Исключить' (or any manual category) never made them go away."""
+
+    NOTE = "Компаньон RAW + HEIC неоднозначен (разрыв 0.0 балла)."
+
+    def _ambiguous(self, analysis: AnalysisResult, manager: SeriesManager) -> list:
+        return [item for item in build_review_queue(analysis, manager, AppSettings(), "ru") if item.reason is ReviewReason.AMBIGUOUS_PAIR]
+
+    def test_excluding_ambiguous_unpaired_files_clears_their_items(self):
+        raw = make_raw(0)
+        heic = make_rendered(0)
+        raw.warnings.append(self.NOTE)
+        heic.warnings.append(self.NOTE)
+        analysis = make_analysis([raw, heic], [])
+        manager = SeriesManager()
+        self.assertEqual(len(self._ambiguous(analysis, manager)), 2)
+        exclude_files([raw, heic], manager)
+        self.assertEqual(self._ambiguous(analysis, manager), [])
+
+    def test_manually_categorised_ambiguous_file_is_not_asked_again(self):
+        from app.manual_overrides import assign_category
+
+        raw = make_raw(0)
+        raw.warnings.append(self.NOTE)
+        assign_category(raw, DestinationCategory.RAW)
+        self.assertEqual(self._ambiguous(make_analysis([raw], []), SeriesManager()), [])
+
+    def test_ambiguous_accepted_pair_with_an_excluded_member_is_not_listed(self):
+        raw = make_raw(0)
+        rendered = make_rendered(0)
+        pair = RawHeicPair(
+            pair_id="PAIR_0001",
+            raw_file=raw,
+            rendered_file=rendered,
+            score=70.0,
+            time_delta=0.2,
+            name_similarity=0.9,
+            metadata_similarity=0.8,
+            preview_similarity=None,
+            ambiguous=True,
+        )
+        analysis = make_analysis([raw, rendered], [], pairs=[pair])
+        manager = SeriesManager()
+        self.assertEqual(len(self._ambiguous(analysis, manager)), 1)
+        exclude_files([rendered], manager)
+        self.assertEqual(self._ambiguous(analysis, manager), [])
 
 
 if __name__ == "__main__":

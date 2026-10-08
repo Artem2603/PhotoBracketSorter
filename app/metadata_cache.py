@@ -70,7 +70,9 @@ def load_cache_entries(entries: list[dict[str, Any]]) -> MetadataCache:
             file_size = int(entry["file_size"])
             mtime_ns = int(entry["mtime_ns"])
             metadata = deserialize_metadata(entry["metadata"])
-        except (KeyError, TypeError, ValueError):
+        except Exception:
+            # A damaged entry (wrong type, bad enum, odd date) only loses its own
+            # cache hit; the session itself must still open.
             continue
         cache[relative_path] = (file_size, mtime_ns, metadata)
     return cache

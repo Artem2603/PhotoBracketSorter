@@ -23,7 +23,8 @@ def detect_format(path: Path, exif_record: dict[str, Any] | None = None) -> tupl
     warnings.extend(signature_warnings)
 
     exif_type = _type_from_exif(file_type, file_type_extension, mime_type, major_brand, compatible_brands)
-    extension_type = _type_from_extension(path.suffix.lower())
+    extension = path.suffix.lower()
+    extension_type = _type_from_extension(extension)
 
     if signature_type is DetectedType.CORRUPTED:
         return signature_type, signature_mime, file_type, file_type_extension, major_brand, compatible_brands, warnings
@@ -31,6 +32,14 @@ def detect_format(path: Path, exif_record: dict[str, Any] | None = None) -> tupl
     detected = exif_type or signature_type
     if detected is DetectedType.UNKNOWN and extension_type is not None:
         detected = extension_type
+        warnings.append("Формат определён только по расширению.")
+    elif exif_type is None and signature_type is DetectedType.TIFF and extension in SUPPORTED_RAW_EXTENSIONS:
+        # ExifTool-fallback mode. NEF, ARW, CR2, ORF, RW2, PEF and most other
+        # manufacturer RAWs are TIFF containers, so the signature alone reads them
+        # as a rendered TIFF and they were filed under HEIC/. Without ExifTool the
+        # extension is the only RAW evidence left, and it is far more reliable than
+        # "any TIFF header is an export".
+        detected = extension_type or DetectedType.RAW
         warnings.append("Формат определён только по расширению.")
     if exif_type and signature_type not in {DetectedType.UNKNOWN, exif_type}:
         if _compatible_family(exif_type, signature_type):

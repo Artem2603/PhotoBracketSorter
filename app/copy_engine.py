@@ -12,7 +12,7 @@ from typing import Callable
 from app.constants import MAIN_OUTPUT_DIRS
 from app.enums import OperationStatus
 from app.errors import CopyCancelled, CopyVerificationError, InsufficientSpaceError
-from app.integrity import sha256_file, verify_unchanged
+from app.integrity import force_unlink, sha256_file, verify_unchanged
 from app.models import AppSettings, CopyOperation, CopyPlan, CopyResult
 
 CopyEventCallback = Callable[[str, int, int], None]
@@ -115,35 +115,37 @@ class CopyEngine:
         current_size = source.stat().st_size
         destination.parent.mkdir(parents=True, exist_ok=True)
         partial = destination.with_name(destination.name + ".partial")
-        if partial.exists():
-            partial.unlink()
+        _remove_partial(partial)
         if self.settings.verify_sha256:
             operation.sha256_source = sha256_file(source)
         if cancel_event.is_set():
             raise CopyCancelled()
-        # copy2 carries timestamps across; copy deliberately does not.
-        if self.settings.preserve_file_times:
-            shutil.copy2(source, partial)
-        else:
-            shutil.copy(source, partial)
-        if cancel_event.is_set():
+        try:
+            # copy2 carries timestamps across; copy deliberately does not.
+            if self.settings.preserve_file_times:
+                shutil.copy2(source, partial)
+            else:
+                shutil.copy(source, partial)
+            if cancel_event.is_set():
+                raise CopyCancelled()
+            if partial.stat().st_size != current_size:
+                raise CopyVerificationError("Размер копии не совпадает.", str(destination))
+            if self.settings.verify_sha256:
+                operation.sha256_destination = sha256_file(partial)
+                if operation.sha256_source != operation.sha256_destination:
+                    raise CopyVerificationError("SHA-256 копии не совпадает.", str(destination))
+            os.replace(partial, destination)
+        except BaseException:
+            # Disk full, I/O error, a locked file, cancel: never leave a .partial
+            # behind in the result folder.
             _remove_partial(partial)
-            raise CopyCancelled()
-        if partial.stat().st_size != current_size:
-            _remove_partial(partial)
-            raise CopyVerificationError("Размер копии не совпадает.", str(destination))
-        if self.settings.verify_sha256:
-            operation.sha256_destination = sha256_file(partial)
-            if operation.sha256_source != operation.sha256_destination:
-                _remove_partial(partial)
-                raise CopyVerificationError("SHA-256 копии не совпадает.", str(destination))
-        os.replace(partial, destination)
+            raise
         operation.status = OperationStatus.COMPLETED
 
 
 def _remove_partial(path: Path) -> None:
     if path.exists():
-        path.unlink()
+        force_unlink(path)
 
 
 def _phase(events: CopyEventCallback | None, phase: str, done: int, total: int) -> None:

@@ -12,7 +12,7 @@ from typing import Callable
 from app.constants import MAIN_OUTPUT_DIRS
 from app.enums import OperationStatus
 from app.errors import CopyVerificationError, InsufficientSpaceError, MoveCancelled
-from app.integrity import sha256_file, verify_unchanged
+from app.integrity import force_unlink, sha256_file, verify_unchanged
 from app.models import AppSettings, CopyOperation, CopyPlan, CopyResult
 
 MoveEventCallback = Callable[[str, int, int], None]
@@ -22,7 +22,9 @@ DeleteFunc = Callable[[Path], None]
 class MoveEngine:
     def __init__(self, settings: AppSettings | None = None, delete_func: DeleteFunc | None = None):
         self.settings = settings or AppSettings()
-        self._delete = delete_func or Path.unlink
+        # force_unlink clears a read-only attribute first: a camera-"protected"
+        # source would otherwise end every move as DELETE_FAILED on Windows.
+        self._delete = delete_func or force_unlink
 
     def execute(
         self,
@@ -127,28 +129,29 @@ class MoveEngine:
         current_size = source.stat().st_size
         destination.parent.mkdir(parents=True, exist_ok=True)
         partial = destination.with_name(destination.name + ".partial")
-        if partial.exists():
-            partial.unlink()
+        _remove_partial(partial)
         if self.settings.verify_sha256:
             operation.sha256_source = sha256_file(source)
         if cancel_event.is_set():
             raise MoveCancelled()
-        if self.settings.preserve_file_times:
-            shutil.copy2(source, partial)
-        else:
-            shutil.copy(source, partial)
-        if cancel_event.is_set():
+        try:
+            if self.settings.preserve_file_times:
+                shutil.copy2(source, partial)
+            else:
+                shutil.copy(source, partial)
+            if cancel_event.is_set():
+                raise MoveCancelled()
+            if partial.stat().st_size != current_size:
+                raise CopyVerificationError("Размер копии не совпадает.", str(destination))
+            if self.settings.verify_sha256:
+                operation.sha256_destination = sha256_file(partial)
+                if operation.sha256_source != operation.sha256_destination:
+                    raise CopyVerificationError("SHA-256 копии не совпадает.", str(destination))
+            os.replace(partial, destination)
+        except BaseException:
+            # Never leave a .partial behind, whatever interrupted the copy.
             _remove_partial(partial)
-            raise MoveCancelled()
-        if partial.stat().st_size != current_size:
-            _remove_partial(partial)
-            raise CopyVerificationError("Размер копии не совпадает.", str(destination))
-        if self.settings.verify_sha256:
-            operation.sha256_destination = sha256_file(partial)
-            if operation.sha256_source != operation.sha256_destination:
-                _remove_partial(partial)
-                raise CopyVerificationError("SHA-256 копии не совпадает.", str(destination))
-        os.replace(partial, destination)
+            raise
         operation.status = OperationStatus.COMPLETED
 
     def _delete_source(self, operation: CopyOperation) -> None:
@@ -162,7 +165,7 @@ class MoveEngine:
 
 def _remove_partial(path: Path) -> None:
     if path.exists():
-        path.unlink()
+        force_unlink(path)
 
 
 def _phase(events: MoveEventCallback | None, phase: str, done: int, total: int) -> None:

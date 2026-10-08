@@ -409,5 +409,179 @@ class SettingsIntegrationTests(unittest.TestCase):
         self.assertTrue(reloaded.exposure_source_priority)
 
 
+class FastSeriesProfileTests(unittest.TestCase):
+    """Regression: any series faster than 0.8 s got duration = 1.5x its length while
+    the adjacent delta stayed at the default 1.2 s, so validate_settings rejected
+    the profile ("duration 3 < adjacent") before it could ever be saved."""
+
+    def _frames(self, times: tuple[float, ...]) -> list:
+        from app.enums import DetectedType
+        from app.models import PhotoFile, PhotoMetadata
+
+        frames = []
+        for index, seconds in enumerate(times):
+            name = f"IMG_{index}.dng"
+            frames.append(
+                PhotoFile(
+                    metadata=PhotoMetadata(
+                        source_path=Path(f"C:/p/{name}"),
+                        relative_path=Path(name),
+                        file_name=name,
+                        extension=".dng",
+                        detected_type=DetectedType.DNG,
+                        capture_time=BASE_TIME + timedelta(seconds=seconds),
+                        file_size=1000,
+                    )
+                )
+            )
+        return frames
+
+    def _series(self, duration: float, frames: list | None = None, size: int = 3) -> BracketSeries:
+        return BracketSeries(
+            series_id=f"HDR{size}_0001",
+            series_number=1,
+            series_size=size,
+            raw_files=frames or [],
+            rendered_companions={},
+            start_time=BASE_TIME,
+            end_time=BASE_TIME + timedelta(seconds=duration),
+            duration_seconds=duration,
+            exposure_values=[-2.0, 0.0, 2.0],
+            estimated_step_ev=2.0,
+            confidence=95.0,
+            confidence_level=ConfidenceLevel.HIGH,
+            automatic=True,
+            manually_confirmed=True,
+            exposure_source="EV100",
+        )
+
+    def test_a_0_4_second_three_frame_series_yields_a_valid_profile(self):
+        profile = profile_from_confirmed_series(self._series(0.4, self._frames((0.0, 0.2, 0.4))), "Phone")
+        applied = apply_profile(AppSettings(), profile)  # used to raise ProfileError
+        self.assertAlmostEqual(profile.max_bracket_adjacent_delta_seconds, 0.3, places=2)  # 0.2 s gap x1.5, at the 0.3 s floor
+        self.assertAlmostEqual(profile.max_bracket_duration_seconds_3, 0.6, places=2)
+        self.assertGreaterEqual(profile.max_bracket_duration_seconds_3, profile.max_bracket_adjacent_delta_seconds)
+        self.assertEqual(applied.max_bracket_adjacent_delta_seconds, profile.max_bracket_adjacent_delta_seconds)
+
+    def test_adjacent_delta_follows_the_real_maximum_gap_not_the_average(self):
+        profile = profile_from_confirmed_series(self._series(1.0, self._frames((0.0, 0.2, 1.0))), "X")
+        self.assertAlmostEqual(profile.max_bracket_adjacent_delta_seconds, 1.2, places=2)  # 0.8 s x 1.5
+        apply_profile(AppSettings(), profile)
+
+    def test_series_without_per_frame_times_falls_back_to_even_spacing(self):
+        profile = profile_from_confirmed_series(self._series(0.4), "X")
+        self.assertAlmostEqual(profile.max_bracket_adjacent_delta_seconds, 0.3, places=2)
+        apply_profile(AppSettings(), profile)
+
+    def test_every_duration_validates_including_sub_second_ones(self):
+        for size in (3, 5):
+            for duration in (0.2, 0.3, 0.5, 0.79, 0.8, 1.6, 10.0):
+                profile = profile_from_confirmed_series(self._series(duration, size=size), f"X{duration}")
+                apply_profile(AppSettings(), profile)
+                self.assertGreaterEqual(profile.max_bracket_duration_seconds_3, profile.max_bracket_adjacent_delta_seconds)
+                self.assertGreaterEqual(profile.max_bracket_duration_seconds_5, profile.max_bracket_adjacent_delta_seconds)
+
+    def test_the_other_size_keeps_the_default_unless_the_gap_needs_more(self):
+        fast = profile_from_confirmed_series(self._series(0.4), "X")
+        self.assertEqual(fast.max_bracket_duration_seconds_5, AppSettings().max_bracket_duration_seconds_5)
+        slow = profile_from_confirmed_series(self._series(10.0), "Y")  # 5 s gaps -> 7.5 s adjacent delta
+        self.assertEqual(slow.max_bracket_duration_seconds_5, 7.5)
+
+
+class MalformedProfileValueTests(unittest.TestCase):
+    """Every malformed JSON value must surface as ProfileError naming the field —
+    never a bare TypeError/ValueError escaping from a conversion."""
+
+    def _import(self, **fields):
+        return import_profile_json(json.dumps({"name": "X", "schema_version": CURRENT_PROFILE_SCHEMA, **fields}))
+
+    def test_non_list_formats_raise_profile_error(self):
+        with self.assertRaises(ProfileError) as caught:
+            self._import(raw_formats=5)
+        self.assertIn("raw_formats", caught.exception.user_message)
+
+    def test_list_with_non_string_items_raises_profile_error(self):
+        with self.assertRaises(ProfileError):
+            self._import(rendered_formats=[".heic", 7])
+
+    def test_non_numeric_schema_version_raises_profile_error(self):
+        with self.assertRaises(ProfileError):
+            import_profile_json(json.dumps({"name": "X", "schema_version": "abc"}))
+        with self.assertRaises(ProfileError):
+            migrate_profile_dict({"schema_version": [2]})
+
+    def test_non_numeric_expected_bracket_sizes_raise_profile_error(self):
+        for sizes in (["3", "x"], 5, [None]):
+            with self.assertRaises(ProfileError, msg=repr(sizes)):
+                import_profile_json(json.dumps({"name": "X", "schema_version": 1, "expected_bracket_sizes": sizes}))
+
+    def test_booleans_must_be_real_booleans(self):
+        for value in ("no", "yes", "false", 0, 1):
+            for field in ("use_name_for_pairing", "use_exif_for_pairing", "use_preview_for_pairing", "is_auto"):
+                with self.assertRaises(ProfileError, msg=f"{field}={value!r}"):
+                    self._import(**{field: value})
+
+    def test_numbers_must_be_finite_numbers(self):
+        for value in ("abc", "1e999", [1], {"a": 1}, True, False):
+            with self.assertRaises(ProfileError, msg=repr(value)):
+                self._import(min_auto_confidence=value)
+
+    def test_numeric_strings_are_still_accepted(self):
+        self.assertEqual(self._import(max_pair_delta_seconds="0.5").max_pair_delta_seconds, 0.5)
+
+    def test_text_fields_must_be_strings(self):
+        with self.assertRaises(ProfileError):
+            self._import(manufacturer=12)
+        with self.assertRaises(ProfileError):
+            self._import(bracket_size_mode=3)
+
+    def test_null_values_fall_back_to_defaults(self):
+        profile = self._import(manufacturer=None, raw_formats=None, min_auto_confidence=None, use_name_for_pairing=None)
+        self.assertEqual(profile.manufacturer, "")
+        self.assertEqual(profile.raw_formats, ())
+        self.assertEqual(profile.min_auto_confidence, 72.0)
+        self.assertTrue(profile.use_name_for_pairing)
+
+    def test_user_profiles_file_with_a_bad_value_raises_profile_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "camera_profiles.json"
+            path.write_text(json.dumps([{"name": "Bad", "schema_version": CURRENT_PROFILE_SCHEMA, "raw_formats": 5}]), encoding="utf-8")
+            with self.assertRaises(ProfileError):
+                load_user_profiles(path)
+
+
+class BundledProfileIdentityTests(unittest.TestCase):
+    """Regression: bundled profiles got a fresh uuid on every load, so an id the
+    GUI had just listed could never be found again."""
+
+    def test_bundled_ids_are_stable_across_loads(self):
+        first = {profile.name: profile.profile_id for profile in bundled_profiles()}
+        second = {profile.name: profile.profile_id for profile in bundled_profiles()}
+        self.assertTrue(first)
+        self.assertEqual(first, second)
+
+    def test_distinct_bundled_files_get_distinct_ids(self):
+        ids = [profile.profile_id for profile in bundled_profiles()]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_find_profile_locates_every_bundled_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "camera_profiles.json"
+            for profile in bundled_profiles():
+                found = find_profile(profile.profile_id, path)
+                self.assertIsNotNone(found, profile.name)
+                self.assertEqual(found.name, profile.name)
+                self.assertTrue(found.is_builtin)
+
+    def test_bundled_profiles_are_protected_like_other_builtins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "camera_profiles.json"
+            bundled_id = bundled_profiles()[0].profile_id
+            with self.assertRaises(ProfileError):
+                delete_profile(bundled_id, path=path)
+            with self.assertRaises(ProfileError):
+                update_profile(bundled_id, path=path, name="Hacked")
+
+
 if __name__ == "__main__":
     unittest.main()

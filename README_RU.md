@@ -1,4 +1,4 @@
-# Photo Bracket Sorter 1.1.0
+# Photo Bracket Sorter 1.2.1
 
 Portable-приложение Windows для сортировки папок с HEIC/JPEG, RAW/DNG и сериями брекетинга на 3 или 5 кадров.
 

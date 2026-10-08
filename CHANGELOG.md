@@ -1,5 +1,136 @@
 # Changelog
 
+## 1.2.1 (maintenance)
+
+A hardening pass over 1.2.0 driven by a full code review: data-safety fixes in
+the transfer engines and the undo journal, detector and pairing corrections,
+robustness against damaged configuration files, and a visual refresh of the
+main window. No file-layout or report-format changes; existing sessions,
+journals and profiles keep working.
+
+Test suite: 656 tests (527 in 1.2.0), green on Windows paths and on Linux, in
+every timezone.
+
+### Fixed — data safety
+
+- **Move with duplicate policy `overwrite` could destroy a photo.** Two sources
+  with the same name in different subfolders (`100APPLE/IMG_0001.JPG`,
+  `101APPLE/IMG_0001.JPG`) were planned onto one destination; the second copy
+  overwrote the first *after* its source had already been deleted. `overwrite`
+  now only applies to files that already exist on disk; same-named files within
+  one run get `_02`, `_03…` suffixes, and the plan refuses two operations with
+  the same destination outright. `skip` names the files it drops in the warning.
+- A cancelled Undo-move no longer marks the whole move as undone; the remaining
+  files can be restored by running Undo again (already-restored files are
+  skipped, not reported as errors).
+- Undo now checks the file size even when SHA-256 verification was off, so it
+  never copies a foreign file back over the original's path.
+- `.partial` files are removed on *every* copy failure (disk full, I/O error,
+  locked file), not only on cancel. Read-only sources and partials (camera
+  "protected" shots) are deleted correctly on Windows instead of ending as
+  `DELETE_FAILED` or `PermissionError`.
+- Closing the window during a Copy/Move now asks for confirmation, cancels the
+  worker and waits for the current file, so the report and the journal entry are
+  written; previously the thread was killed and nothing was recorded.
+- Journal: a damaged `operations_journal.json` is set aside (`.broken-<time>`)
+  instead of being overwritten; a BOM or a `null` entry no longer loses the
+  history; saves are atomic (write-then-rename). Settings saves are atomic too.
+- "Processed N of N" in reports and the summary dialog no longer counts files a
+  cancelled run never attempted.
+
+### Fixed — detection and pairing
+
+- Auto-exposure bursts with a slight shutter/ISO drift (e.g. 1/125, 1/140,
+  1/160 at EC 0) were accepted as HDR3/HDR5 series and routed to
+  `BRACKETING_*`. The exposure-span check is now a hard gate; such groups stay
+  visible as near misses in the review queue but are never auto-accepted.
+- RAW + HEIC/JPEG pairs where one side carries a UTC offset and the other does
+  not were only found when the PC's timezone equalled the camera's offset; the
+  candidate index is now timezone-independent (and pre-1970 timestamps no
+  longer raise on Windows).
+- In ExifTool-fallback mode TIFF-container RAWs (NEF, ARW, CR2, ORF, RW2, PEF…)
+  were classified as rendered TIFF and filed under `HEIC/`; they are RAW again.
+- Perceptual hashes of 16-bit images no longer clip to white.
+- `Restore automatic decision` in the review queue gave the restored series an
+  id and folder already used by another series.
+- `store_companions_inside_series` was ignored: companions were always moved
+  into the series folder. The setting is honoured now.
+- `Create profile from confirmed series` failed for any bracket shot in under
+  0.8 s; the adjacent-frame limit is derived from the real series now.
+- Auto-configure no longer treats tiny exposure drift as bracket evidence, and
+  applying only a duration suggestion can no longer produce settings that fail
+  validation.
+- The review queue no longer floods with one near-miss item per sliding window
+  of a long burst, and items for excluded or manually overridden files clear.
+- Any series operation re-selected every member of every series, undoing a
+  user's deselection of a frame.
+- Camera profile import reports a clear error for malformed JSON instead of a
+  traceback; bundled profiles keep a stable id between loads.
+
+### Fixed — robustness
+
+- A damaged `settings.json` (trailing comma, Notepad BOM, `"worker_count": "4"`,
+  unknown enum value) no longer prevents the application from starting: the
+  window opens with defaults, says why, and leaves the file untouched for
+  inspection. Hand-edited scalar values are coerced; every other problem is a
+  `SettingsError`.
+- Schema-1 settings migration was a no-op (defaults were merged in first), so an
+  old `max_bracket_duration_seconds` never reached the per-size limits.
+- ExifTool: file names are passed through a UTF-8 argfile (`-@`), the way
+  ExifTool documents for Windows, so non-ASCII paths such as
+  `C:\Users\Артём\DCIM` are read instead of silently losing all metadata; the
+  per-batch timeout scales with the batch size; a blocked or quarantined
+  `exiftool.exe` raises an application error instead of crashing the analysis,
+  and a failing batch degrades those files to fallback mode with a warning
+  rather than aborting everything. A system `exiftool` on PATH, or an explicit
+  `exiftool_path`, is probed and used; previously anything without the bundled
+  `exiftool_files` folder was silently ignored.
+- Metadata reading reports progress and honours Cancel between ExifTool
+  batches (large folders looked frozen at "Определение форматов 0/N").
+- Extended classification (burst/panorama labels) extracted up to three
+  embedded previews per RAW frame with one ExifTool process each, for every
+  frame of every burst, during analysis. It now samples at most six frames per
+  group and uses a single ExifTool call per group.
+- Folders whose path merely contains the letters "mtp" (`C:\Photos\MTP_backup`)
+  were rejected as phone paths; only shell-namespace (`::{…}`) and `mtp://`
+  paths are rejected now. Windows reserved names (`CON`, `NUL`, `COM1`…) and
+  attribute placeholders (`{date.year}`) in folder templates are handled.
+- Opening a `.pbsession` saved on another machine no longer overwrites this
+  machine's language, theme, window geometry, `exiftool_path` or log level.
+- First-run language follows the Windows display language (the old check read
+  `LANG`, which Windows never sets, so Russian users got English).
+- `report.csv` cells starting with `=`, `+`, `-` or `@` are prefixed with an
+  apostrophe so Excel does not execute them as formulas.
+- A ttkbootstrap `Style` outliving its Tk root (second window in one process)
+  no longer fails with "application has been destroyed"; the suite is also
+  timezone-independent and runs on Linux/macOS.
+
+### Changed — interface
+
+- Action bar in two rows with colour roles: Analyze (accent), Copy (green),
+  Move (orange), Cancel (red outline), utilities in grey; thirteen identical
+  buttons used to overflow the window in Russian.
+- Summary cards have borders and coloured counts and act as filter shortcuts
+  (click again to clear). Table rows are coloured by outcome: errors red, review
+  amber, series in the accent colour, skipped/deselected muted; the "selected"
+  column shows a check mark instead of "yes"/"no".
+- The main preview shows embedded JPEG previews for RAW/DNG (and HEIC without a
+  decoder) through ExifTool instead of a placeholder, decoded on a background
+  thread so selecting rows never freezes the window. `pillow-heif` is detected
+  automatically for full HEIC previews.
+- `system` theme follows the Windows "choose your app mode" setting; theme names
+  in the toolbar are localized.
+- Settings dialog shows human-readable Russian/English labels instead of field
+  identifiers; progress phases, the context menu, the move confirmation and the
+  Help dialog (now with the workflow and shortcuts) are localized; Help, review
+  queue, history and profile dialogs got their missing scrollbars.
+- A remembered window geometry is clamped to the current screen; folder pickers
+  open at the current path.
+
+### Removed
+
+- `app/workers.py` (unused event classes).
+
 ## 1.2.0 (in progress)
 
 ### Added — automatic analysis configuration (feature 1)

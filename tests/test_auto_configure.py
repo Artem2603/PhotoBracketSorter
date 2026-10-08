@@ -21,6 +21,7 @@ def raw_meta(
     make: str = "Canon",
     model: str = "EOS R5",
     cluster_gap: float = 30.0,
+    spacing: float = 0.4,
 ) -> PhotoMetadata:
     name = f"IMG_{cluster:02d}_{index}.dng"
     return PhotoMetadata(
@@ -29,7 +30,7 @@ def raw_meta(
         file_name=name,
         extension=".dng",
         detected_type=DetectedType.DNG,
-        capture_time=BASE_TIME + timedelta(seconds=cluster * cluster_gap + index * 0.4),
+        capture_time=BASE_TIME + timedelta(seconds=cluster * cluster_gap + index * spacing),
         make=make,
         model=model,
         lens_model="RF24-70",
@@ -273,6 +274,111 @@ class NoNoiseSuggestionsTests(unittest.TestCase):
         settings.bracket_size_mode = BracketSizeMode.THREE
         report = analyze_for_suggestions(hdr3_flat_ec_dataset(), settings, "ru")
         self.assertEqual(report.suggestions, ())
+
+
+class AutoExposureDriftTests(unittest.TestCase):
+    """Regression: discovery accepted any span >= 0.05 EV, so plain bursts with mild
+    auto-exposure drift (1/125 -> 1/140 -> 1/160, 0.36 EV in total) counted as HDR3
+    series and the tool suggested min_exposure_span_ev ~ 0.1 and sub-second
+    durations for a folder that holds no bracket at all."""
+
+    def _drift_bursts(self, clusters: int = 6) -> list[PhotoMetadata]:
+        return [raw_meta(cluster, index, shutter, make="Sony", model="A7") for cluster in range(clusters) for index, shutter in enumerate((1 / 125, 1 / 140, 1 / 160))]
+
+    def test_drift_bursts_are_not_counted_as_series(self):
+        report = analyze_for_suggestions(self._drift_bursts(), AppSettings(), "en")
+        self.assertIsNone(report.typical_series_size)
+        self.assertEqual(report.series_size_histogram, {})
+        self.assertFalse(any(suggestion.field in {"min_exposure_span_ev", "max_bracket_duration_seconds_3"} for suggestion in report.suggestions))
+        self.assertTrue(report.warnings)
+
+    def test_discovery_span_follows_the_documented_rule(self):
+        from app.auto_configure import _discovery_min_span_ev
+
+        settings = AppSettings()
+        settings.min_exposure_span_ev = 0.7
+        self.assertAlmostEqual(_discovery_min_span_ev(settings), 0.5)  # the 0.5 EV floor
+        settings.min_exposure_span_ev = 3.0
+        self.assertAlmostEqual(_discovery_min_span_ev(settings), 1.5)  # half of a strict user setting
+        settings.min_exposure_span_ev = 0.3
+        self.assertAlmostEqual(_discovery_min_span_ev(settings), 0.3)  # never stricter than the user
+
+    def test_a_modest_but_genuine_bracket_still_surfaces(self):
+        # +-2/3 EV around the middle frame: log2(200/80) = 1.32 EV in total.
+        items = [raw_meta(cluster, index, shutter) for cluster in range(5) for index, shutter in enumerate((1 / 200, 1 / 125, 1 / 80))]
+        report = analyze_for_suggestions(items, AppSettings(), "en")
+        self.assertEqual(report.typical_series_size, 3)
+
+
+class TimingConsistencyOnApplyTests(unittest.TestCase):
+    """Regression: accepting only the duration suggestion left the adjacent delta
+    above it, which validate_settings rejects ("duration 3 < adjacent") — the
+    error surfaced later in the settings dialog instead of being impossible."""
+
+    def _fast_dataset(self) -> list[PhotoMetadata]:
+        # 0.2 s between frames: duration 0.4 s -> suggested duration 0.6 s, adjacent 0.3 s.
+        return [raw_meta(cluster, index, shutter, spacing=0.2) for cluster in range(5) for index, shutter in enumerate((1 / 500, 1 / 125, 1 / 30))]
+
+    def _slow_dataset(self) -> list[PhotoMetadata]:
+        # 3 s between frames: the adjacent suggestion (4.5 s) exceeds the default 4.0 s HDR3 duration.
+        return [raw_meta(cluster, index, shutter, spacing=3.0, cluster_gap=120.0) for cluster in range(5) for index, shutter in enumerate((1 / 500, 1 / 125, 1 / 30))]
+
+    def test_duration_only_acceptance_still_validates(self):
+        from app.settings import validate_settings
+
+        settings = AppSettings()
+        report = analyze_for_suggestions(self._fast_dataset(), settings, "en")
+        duration = next(suggestion for suggestion in report.suggestions if suggestion.field == "max_bracket_duration_seconds_3")
+        self.assertLess(duration.suggested_value, settings.max_bracket_adjacent_delta_seconds, "fixture must produce the conflicting shape")
+        result = apply_suggestions(settings, report.suggestions, accepted_fields={"max_bracket_duration_seconds_3"})
+        validate_settings(result)  # must not raise
+        self.assertEqual(result.max_bracket_duration_seconds_3, duration.suggested_value)
+        self.assertLessEqual(result.max_bracket_adjacent_delta_seconds, result.max_bracket_duration_seconds_3)
+
+    def test_adjacent_only_acceptance_that_widens_still_validates(self):
+        from app.settings import validate_settings
+
+        settings = AppSettings()
+        report = analyze_for_suggestions(self._slow_dataset(), settings, "en")
+        adjacent = next(suggestion for suggestion in report.suggestions if suggestion.field == "max_bracket_adjacent_delta_seconds")
+        self.assertGreater(adjacent.suggested_value, settings.max_bracket_duration_seconds_3, "fixture must produce the conflicting shape")
+        result = apply_suggestions(settings, report.suggestions, accepted_fields={"max_bracket_adjacent_delta_seconds"})
+        validate_settings(result)
+        self.assertEqual(result.max_bracket_adjacent_delta_seconds, adjacent.suggested_value)
+        self.assertGreaterEqual(result.max_bracket_duration_seconds_3, adjacent.suggested_value)
+        self.assertGreaterEqual(result.max_bracket_duration_seconds, adjacent.suggested_value)
+
+    def test_accepting_both_timing_suggestions_keeps_both(self):
+        from app.settings import validate_settings
+
+        settings = AppSettings()
+        report = analyze_for_suggestions(self._fast_dataset(), settings, "en")
+        accepted = {"max_bracket_duration_seconds_3", "max_bracket_adjacent_delta_seconds"}
+        result = apply_suggestions(settings, report.suggestions, accepted_fields=accepted)
+        validate_settings(result)
+        for field in accepted:
+            self.assertEqual(getattr(result, field), next(suggestion.suggested_value for suggestion in report.suggestions if suggestion.field == field))
+
+    def test_every_subset_of_suggestions_validates(self):
+        from itertools import combinations
+
+        from app.settings import validate_settings
+
+        for dataset in (self._fast_dataset(), self._slow_dataset()):
+            settings = AppSettings()
+            report = analyze_for_suggestions(dataset, settings, "en")
+            fields = [suggestion.field for suggestion in report.suggestions]
+            self.assertTrue(fields)
+            for count in range(len(fields) + 1):
+                for subset in combinations(fields, count):
+                    validate_settings(apply_suggestions(settings, report.suggestions, accepted_fields=set(subset)))
+
+    def test_untouched_settings_are_not_rewritten(self):
+        settings = AppSettings()
+        report = analyze_for_suggestions(hdr3_flat_ec_dataset(), settings, "en")
+        result = apply_suggestions(settings, report.suggestions, accepted_fields={"min_auto_confidence"})
+        changed = {key for key in settings.snapshot() if settings.snapshot()[key] != result.snapshot()[key]}
+        self.assertEqual(changed, {"min_auto_confidence"})
 
 
 if __name__ == "__main__":

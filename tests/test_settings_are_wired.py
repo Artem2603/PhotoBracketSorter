@@ -118,9 +118,29 @@ class DuplicateBehaviorTests(unittest.TestCase):
         reserved = {Path("out/a.dng")}
         self.assertIsNone(resolve_destination(Path("out/a.dng"), reserved, "skip"))
 
-    def test_overwrite_reuses_the_path(self):
+    def test_overwrite_reuses_a_path_that_exists_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = Path(tmp) / "a.dng"
+            existing.write_bytes(b"old")
+            reserved: set[Path] = set()
+            self.assertEqual(resolve_destination(existing, reserved, "overwrite"), existing)
+
+    def test_overwrite_never_reuses_a_path_claimed_by_the_same_plan(self):
+        # Two same-named sources in one run (100APPLE/IMG_0001.JPG and
+        # 101APPLE/IMG_0001.JPG) must not share a destination: in Move mode the
+        # second copy would overwrite the first *after* its source was deleted.
         reserved = {Path("out/a.dng")}
-        self.assertEqual(resolve_destination(Path("out/a.dng"), reserved, "overwrite"), Path("out/a.dng"))
+        self.assertEqual(resolve_destination(Path("out/a.dng"), reserved, "overwrite"), Path("out/a_02.dng"))
+
+    def test_overwrite_plan_keeps_both_colliding_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = AppSettings()
+            settings.duplicate_behavior = "overwrite"
+            files = [make_photo_file("a.dng", "one/a.dng"), make_photo_file("a.dng", "two/a.dng")]
+            plan = build_copy_plan(make_analysis(files, root / "src"), root / "out", settings)
+            self.assertEqual(len(plan.operations), 2)
+            self.assertEqual(len({op.destination_path for op in plan.operations}), 2)
 
     def test_skip_drops_colliding_operations_from_the_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -327,6 +347,74 @@ class MixedTimezoneSafeModeTests(unittest.TestCase):
             self.assertIsNone(safe_datetime_difference_seconds(aware, naive).seconds)
         finally:
             set_mixed_timezone_safe_mode(True)
+
+
+class StoreCompanionsInsideSeriesTests(unittest.TestCase):
+    """Regression: the checkbox was saved and shown but changed nothing — the
+    HEIC/JPEG companion of a series RAW was always moved into the series folder."""
+
+    def _items(self) -> list[PhotoMetadata]:
+        items = []
+        for index, compensation in enumerate((-1.0, 0.0, 1.0)):
+            for extension, detected, offset in ((".dng", DetectedType.DNG, 0.0), (".heic", DetectedType.HEIC, 0.1)):
+                name = f"IMG_{index}{extension}"
+                items.append(
+                    PhotoMetadata(
+                        source_path=Path(f"C:/photos/{name}"),
+                        relative_path=Path(name),
+                        file_name=name,
+                        extension=extension,
+                        detected_type=detected,
+                        capture_time=BASE_TIME + timedelta(seconds=0.4 * index + offset),
+                        make="Xiaomi",
+                        model="Xiaomi 14",
+                        lens_model="main",
+                        width=4000,
+                        height=3000,
+                        orientation="1",
+                        exposure_compensation=compensation,
+                        exposure_time=1 / 125,
+                        f_number=1.8,
+                        iso=100,
+                        file_size=1000,
+                    )
+                )
+        return items
+
+    def _classify(self, flag: bool):
+        from app.classification import Classifier
+
+        settings = AppSettings()
+        settings.store_companions_inside_series = flag
+        files, pairs, _candidates, series, _statistics = Classifier().classify(self._items(), settings)
+        self.assertEqual(len(series), 1, "fixture must form one automatic series")
+        self.assertEqual(len(pairs), 3, "fixture must pair every RAW with its HEIC")
+        companions = [file for file in files if file.metadata.detected_type is DetectedType.HEIC]
+        return series[0], companions
+
+    def test_enabled_moves_companions_into_the_series_folder(self):
+        series, companions = self._classify(True)
+        for heic in companions:
+            self.assertEqual(heic.series_id, series.series_id)
+            self.assertIs(heic.destination_category, DestinationCategory.BRACKETING_3)
+            self.assertEqual(heic.destination_subpath, series.destination_root / "HEIC" / heic.metadata.file_name)
+
+    def test_disabled_keeps_companions_in_heic_but_keeps_the_pair(self):
+        series, companions = self._classify(False)
+        for heic in companions:
+            self.assertIsNone(heic.series_id)
+            self.assertIs(heic.destination_category, DestinationCategory.HEIC)
+            self.assertEqual(heic.destination_subpath, Path("HEIC") / heic.metadata.file_name)
+            self.assertIsNotNone(heic.pair_id, "the pair relation must survive")
+        # The series still knows its companions; they are simply not stored inside it.
+        self.assertEqual(sum(1 for companion in series.rendered_companions.values() if companion is not None), 3)
+        for raw in series.raw_files:
+            self.assertEqual(raw.series_id, series.series_id)
+
+    def test_the_two_values_produce_different_layouts(self):
+        _inside_series, inside = self._classify(True)
+        _outside_series, outside = self._classify(False)
+        self.assertNotEqual({heic.destination_subpath for heic in inside}, {heic.destination_subpath for heic in outside})
 
 
 if __name__ == "__main__":

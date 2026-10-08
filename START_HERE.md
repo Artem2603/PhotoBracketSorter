@@ -1,6 +1,6 @@
 # Start Here
 
-1. Extract `PhotoBracketSorter-1.1.0-portable.zip` to an empty folder.
+1. Extract `PhotoBracketSorter-1.2.1-portable.zip` to an empty folder.
 2. Run `PhotoBracketSorter.exe`.
 3. Choose a source folder copied from your camera or phone.
 4. Choose an output parent folder outside the source folder.

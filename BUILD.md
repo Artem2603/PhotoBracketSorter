@@ -17,9 +17,16 @@ python -m venv .venv
 Or simply run `build.bat`, which pins the working directory, requires a virtual
 environment, and sets `PYTHONHASHSEED` / `SOURCE_DATE_EPOCH` for reproducibility.
 
-`test.bat` runs the suite (207 tests). `pytest` is optional; the suite runs under
-plain `unittest`, but the top-level directory must be the project root
-(`-t .`) so `from app...` imports resolve.
+`test.bat` runs the suite. `pytest` is optional; the suite runs under plain
+`unittest`, but the top-level directory must be the project root (`-t .`) so
+`from app...` imports resolve.
+
+The core and the test suite also run on Linux/macOS development machines
+(a system `exiftool` on PATH is used there instead of the bundled Windows
+binary, and the drive-letter check only applies on Windows). The GUI tests
+need a display; under Linux use `xvfb-run -a python -m unittest discover -s tests -t .`.
+Tests are timezone-independent; run them under a second `TZ` if you touch
+capture-time code.
 
 The spec resolves data folders from `SPECPATH`, so it can be invoked from any
 directory. It aborts the build if `profiles`, `assets`, or `vendor` is missing,

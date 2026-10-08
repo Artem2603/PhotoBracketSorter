@@ -16,7 +16,7 @@ from __future__ import annotations
 import dataclasses
 
 from app.models import AnalysisResult, AppSettings, BracketSeries, PhotoFile, RawHeicPair
-from app.review_queue import ReviewReason, build_review_queue
+from app.review_queue import build_review_queue
 from app.series_manager import SeriesManager
 from app.time_compare import safe_file_time_difference_seconds, sort_photo_files_by_capture_time
 

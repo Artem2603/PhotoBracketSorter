@@ -145,16 +145,18 @@ def _write_csv(analysis: AnalysisResult, copy_result: CopyResult, settings: AppS
         )
         for operation in copy_result.operations:
             writer.writerow(
-                [
-                    operation.relative_source.as_posix(),
-                    operation.destination_path.relative_to(copy_result.output_root).as_posix(),
-                    operation.category.value,
-                    operation.status.value,
-                    "yes" if operation.source_deleted else "no",
-                    operation.series_id or "",
-                    operation.pair_id or "",
-                    operation.sha256_destination or "",
-                ]
+                _csv_safe_row(
+                    [
+                        operation.relative_source.as_posix(),
+                        operation.destination_path.relative_to(copy_result.output_root).as_posix(),
+                        operation.category.value,
+                        operation.status.value,
+                        "yes" if operation.source_deleted else "no",
+                        operation.series_id or "",
+                        operation.pair_id or "",
+                        operation.sha256_destination or "",
+                    ]
+                )
             )
         writer.writerow([])
         writer.writerow([translate("csv.statistic"), translate("csv.value")])
@@ -245,6 +247,21 @@ def _redact_output_root(output_root: Path, settings: AppSettings) -> str:
     if not settings.privacy_redact_absolute_paths:
         return str(output_root)
     return output_root.name
+
+
+def _csv_safe_row(cells: list) -> list:
+    """Neutralise spreadsheet formula injection from user-controlled names.
+
+    A file called ``=HYPERLINK(...)`` or ``-cmd|...`` is executed by Excel when
+    the CSV is opened; prefixing such cells with an apostrophe makes them text.
+    """
+    safe = []
+    for cell in cells:
+        if isinstance(cell, str) and cell[:1] in ("=", "+", "-", "@", "\t", "\r"):
+            safe.append("'" + cell)
+        else:
+            safe.append(cell)
+    return safe
 
 
 def atomic_write_text(path: Path, text: str) -> None:

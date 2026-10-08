@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import locale
+import os
+import sys
 from dataclasses import dataclass
 
 from app.enums import ConfidenceLevel, DestinationCategory, DetectedType, GroupClassification, OperationStatus
@@ -24,6 +26,93 @@ CATALOGS: dict[str, dict[str, str]] = {
         "theme.system": "Системная",
         "theme.light": "Светлая",
         "theme.dark": "Темная",
+        "top.exiftool_fallback": "ExifTool не найден: аварийный режим",
+        "message.close_while_busy": "Операция ещё выполняется. Отменить её и закрыть программу?\nТекущий файл будет завершён, отчёт и журнал будут записаны.",
+        "menu.create_hdr3": "Создать HDR 3 из выбранных",
+        "menu.create_hdr5": "Создать HDR 5 из выбранных",
+        "menu.dissolve_series": "Расформировать серию",
+        "move.summary": "Файлов: {count}, объём: {size}",
+        "phase.check_folders": "Проверка папок",
+        "phase.scan": "Сканирование",
+        "phase.detect_formats": "Определение форматов",
+        "phase.read_exif": "Чтение EXIF (ExifTool)",
+        "phase.read_metadata": "Чтение метаданных",
+        "phase.pairing": "Поиск RAW + HEIC",
+        "phase.ready": "Готово к проверке",
+        "phase.create_structure": "Создание структуры папок",
+        "phase.copying": "Копирование",
+        "phase.deleting_source": "Удаление исходника",
+        "phase.final_check": "Финальная проверка",
+        "phase.restoring": "Восстановление",
+        "preview.loading": "Загрузка превью…",
+        "message.settings_reset": "Файл настроек не удалось прочитать, использованы настройки по умолчанию.\n{path}\n{reason}",
+        "help.title": "Справка",
+        "help.body": "{app} {version}\n\nКопирование не меняет исходные файлы.\nПеремещение сначала копирует и проверяет файл (размер и SHA-256) и только потом удаляет исходник.\n\nПорядок работы:\n1. Выберите исходную папку и папку результата.\n2. Нажмите «Анализировать» (F5).\n3. Проверьте таблицу: карточки сверху фильтруют строки, правая кнопка мыши открывает меню действий.\n4. Нажмите «Копировать» или «Переместить» (Ctrl+M).\n\nГорячие клавиши:\nCtrl+O — исходная папка\nCtrl+Shift+O — папка результата\nF5 — анализ\nCtrl+M — переместить\nCtrl+Z / Ctrl+Y — отменить / повторить ручное изменение\n\nЖурнал программы: {log}",
+        "settings.field.language": "Язык интерфейса",
+        "settings.field.theme": "Тема",
+        "settings.field.accent": "Акцентный цвет",
+        "settings.field.ui_scale": "Масштаб интерфейса (0.9–1.5)",
+        "settings.field.remember_paths": "Запоминать последние папки",
+        "settings.field.remember_window": "Запоминать размер и положение окна",
+        "settings.field.include_subfolders": "Включать подпапки",
+        "settings.field.include_hidden_files": "Включать скрытые файлы и папки",
+        "settings.field.skip_existing_sorted_folders": "Пропускать уже отсортированные папки (Sorted_Photos_*)",
+        "settings.field.allowed_extensions": "Расширения файлов (через запятую)",
+        "settings.field.excluded_folder_names": "Исключаемые папки (шаблоны через запятую)",
+        "settings.field.detection_mode": "Режим определения серий",
+        "settings.field.bracket_size_mode": "Размер серий брекетинга",
+        "settings.field.max_bracket_adjacent_delta_seconds": "Макс. интервал между соседними кадрами, с",
+        "settings.field.max_bracket_duration_seconds_3": "Макс. длительность серии из 3 кадров, с",
+        "settings.field.max_bracket_duration_seconds_5": "Макс. длительность серии из 5 кадров, с",
+        "settings.field.min_exposure_span_ev": "Мин. разброс экспозиции, EV",
+        "settings.field.exposure_step_tolerance": "Допуск шага экспозиции, EV",
+        "settings.field.require_exposure_for_auto_series": "Требовать данные экспозиции для авто-серий",
+        "settings.field.min_auto_confidence": "Мин. уверенность для авто-серии, %",
+        "settings.field.enable_hdr7": "Распознавать серии из 7 кадров",
+        "settings.field.max_bracket_duration_seconds_7": "Макс. длительность серии из 7 кадров, с",
+        "settings.field.enable_hdr9": "Распознавать серии из 9 кадров",
+        "settings.field.max_bracket_duration_seconds_9": "Макс. длительность серии из 9 кадров, с",
+        "settings.field.enable_incomplete_bracket_detection": "Отмечать неполные серии",
+        "settings.field.enable_focus_bracket_detection": "Распознавать фокус-брекетинг",
+        "settings.field.focus_bracket_exposure_tolerance_ev": "Фокус-брекетинг: допуск экспозиции, EV",
+        "settings.field.focus_bracket_min_focus_spread_ratio": "Фокус-брекетинг: мин. разброс фокуса (отношение)",
+        "settings.field.focus_bracket_visual_similarity_min": "Фокус-брекетинг: мин. визуальное сходство (0–1)",
+        "settings.field.enable_burst_detection": "Распознавать серийную съёмку",
+        "settings.field.burst_visual_similarity_threshold": "Серийная съёмка: порог сходства (0–1)",
+        "settings.field.enable_panorama_detection": "Распознавать вероятные панорамы",
+        "settings.field.panorama_min_frames": "Панорама: мин. число кадров",
+        "settings.field.panorama_visual_similarity_min": "Панорама: мин. сходство соседних кадров (0–1)",
+        "settings.field.panorama_visual_similarity_max": "Панорама: макс. сходство соседних кадров (0–1)",
+        "settings.field.max_pair_delta_seconds": "Макс. разница времени RAW и HEIC/JPEG, с",
+        "settings.field.use_name_for_pairing": "Учитывать имя файла",
+        "settings.field.use_exif_for_pairing": "Учитывать EXIF (камера, параметры съёмки)",
+        "settings.field.use_preview_for_pairing": "Сравнивать превью (медленнее)",
+        "settings.field.pair_accept_score_normal": "Порог совпадения: режим NORMAL",
+        "settings.field.pair_accept_score_strict": "Порог совпадения: режим STRICT",
+        "settings.field.pair_accept_score_soft": "Порог совпадения: режим SOFT",
+        "settings.field.pair_second_best_margin": "Мин. отрыв от второго кандидата",
+        "settings.field.mixed_timezone_safe_mode": "Безопасный режим при смешанных часовых поясах",
+        "settings.field.store_companions_inside_series": "Хранить HEIC/JPEG-пары внутри папки серии",
+        "settings.field.preserve_source_subfolders": "Сохранять структуру исходных подпапок",
+        "settings.field.duplicate_behavior": "При совпадении имён",
+        "settings.field.output_folder_template": "Шаблон имени папки результата",
+        "settings.field.preserve_file_times": "Сохранять даты файлов",
+        "settings.field.preview_only": "Только предпросмотр (ничего не копировать)",
+        "settings.field.require_plan_before_operation": "Подтверждать план перед копированием/перемещением",
+        "settings.field.verify_sha256": "Проверять копии по SHA-256",
+        "settings.field.worker_count": "Потоков чтения метаданных (1–16)",
+        "settings.field.thumbnail_size": "Размер превью, px (96–1024)",
+        "settings.field.preview_cache_items": "Кэш превью, файлов",
+        "settings.field.exiftool_batch_size": "Файлов за один вызов ExifTool",
+        "settings.field.preview_similarity_enabled": "Сравнивать превью при анализе",
+        "settings.field.visual_similarity_threshold": "Порог визуального сходства (0–1)",
+        "settings.field.report_formats": "Форматы отчётов (json, csv, txt)",
+        "settings.field.report_language": "Язык отчётов",
+        "settings.field.report_detail": "Подробность отчётов",
+        "settings.field.csv_english_headers": "Английские заголовки в CSV",
+        "settings.field.privacy_redact_absolute_paths": "Скрывать абсолютные пути в отчётах",
+        "settings.field.exiftool_path": "Путь к exiftool.exe (пусто = встроенный)",
+        "settings.field.log_level": "Уровень логирования",
         "path.source": "Исходная папка",
         "path.output": "Папка результата",
         "path.browse": "Выбрать",
@@ -332,6 +421,93 @@ CATALOGS: dict[str, dict[str, str]] = {
         "theme.system": "System",
         "theme.light": "Light",
         "theme.dark": "Dark",
+        "top.exiftool_fallback": "ExifTool not found: fallback mode",
+        "message.close_while_busy": "An operation is still running. Cancel it and close the application?\nThe current file will be finished and the report and journal will be written.",
+        "menu.create_hdr3": "Create HDR 3 from selection",
+        "menu.create_hdr5": "Create HDR 5 from selection",
+        "menu.dissolve_series": "Dissolve series",
+        "move.summary": "{count} files, {size}",
+        "phase.check_folders": "Checking folders",
+        "phase.scan": "Scanning",
+        "phase.detect_formats": "Detecting formats",
+        "phase.read_exif": "Reading EXIF (ExifTool)",
+        "phase.read_metadata": "Reading metadata",
+        "phase.pairing": "Matching RAW + HEIC",
+        "phase.ready": "Ready for review",
+        "phase.create_structure": "Creating folders",
+        "phase.copying": "Copying",
+        "phase.deleting_source": "Deleting source",
+        "phase.final_check": "Final verification",
+        "phase.restoring": "Restoring",
+        "preview.loading": "Loading preview…",
+        "message.settings_reset": "The settings file could not be read; default settings are in use.\n{path}\n{reason}",
+        "help.title": "Help",
+        "help.body": "{app} {version}\n\nCopy never changes the originals.\nMove copies and verifies each file first (size and SHA-256) and deletes the source only after that.\n\nWorkflow:\n1. Choose the source and output folders.\n2. Press Analyze (F5).\n3. Review the table: the cards above filter rows, right-click opens the actions menu.\n4. Press Copy or Move (Ctrl+M).\n\nShortcuts:\nCtrl+O — source folder\nCtrl+Shift+O — output folder\nF5 — analyze\nCtrl+M — move\nCtrl+Z / Ctrl+Y — undo / redo a manual change\n\nApplication log: {log}",
+        "settings.field.language": "Interface language",
+        "settings.field.theme": "Theme",
+        "settings.field.accent": "Accent colour",
+        "settings.field.ui_scale": "UI scale (0.9–1.5)",
+        "settings.field.remember_paths": "Remember last folders",
+        "settings.field.remember_window": "Remember window size and position",
+        "settings.field.include_subfolders": "Include subfolders",
+        "settings.field.include_hidden_files": "Include hidden files and folders",
+        "settings.field.skip_existing_sorted_folders": "Skip already sorted folders (Sorted_Photos_*)",
+        "settings.field.allowed_extensions": "File extensions (comma-separated)",
+        "settings.field.excluded_folder_names": "Excluded folders (patterns, comma-separated)",
+        "settings.field.detection_mode": "Detection mode",
+        "settings.field.bracket_size_mode": "Bracket size",
+        "settings.field.max_bracket_adjacent_delta_seconds": "Max gap between adjacent frames, s",
+        "settings.field.max_bracket_duration_seconds_3": "Max duration of a 3-frame series, s",
+        "settings.field.max_bracket_duration_seconds_5": "Max duration of a 5-frame series, s",
+        "settings.field.min_exposure_span_ev": "Min exposure span, EV",
+        "settings.field.exposure_step_tolerance": "Exposure step tolerance, EV",
+        "settings.field.require_exposure_for_auto_series": "Require exposure data for automatic series",
+        "settings.field.min_auto_confidence": "Min confidence for automatic series, %",
+        "settings.field.enable_hdr7": "Detect 7-frame series",
+        "settings.field.max_bracket_duration_seconds_7": "Max duration of a 7-frame series, s",
+        "settings.field.enable_hdr9": "Detect 9-frame series",
+        "settings.field.max_bracket_duration_seconds_9": "Max duration of a 9-frame series, s",
+        "settings.field.enable_incomplete_bracket_detection": "Flag incomplete brackets",
+        "settings.field.enable_focus_bracket_detection": "Detect focus bracketing",
+        "settings.field.focus_bracket_exposure_tolerance_ev": "Focus bracket: exposure tolerance, EV",
+        "settings.field.focus_bracket_min_focus_spread_ratio": "Focus bracket: min focus spread (ratio)",
+        "settings.field.focus_bracket_visual_similarity_min": "Focus bracket: min visual similarity (0–1)",
+        "settings.field.enable_burst_detection": "Detect bursts",
+        "settings.field.burst_visual_similarity_threshold": "Burst: similarity threshold (0–1)",
+        "settings.field.enable_panorama_detection": "Detect probable panoramas",
+        "settings.field.panorama_min_frames": "Panorama: min frames",
+        "settings.field.panorama_visual_similarity_min": "Panorama: min similarity of neighbours (0–1)",
+        "settings.field.panorama_visual_similarity_max": "Panorama: max similarity of neighbours (0–1)",
+        "settings.field.max_pair_delta_seconds": "Max time difference RAW vs HEIC/JPEG, s",
+        "settings.field.use_name_for_pairing": "Use the file name",
+        "settings.field.use_exif_for_pairing": "Use EXIF (camera, shooting parameters)",
+        "settings.field.use_preview_for_pairing": "Compare previews (slower)",
+        "settings.field.pair_accept_score_normal": "Accept score: NORMAL mode",
+        "settings.field.pair_accept_score_strict": "Accept score: STRICT mode",
+        "settings.field.pair_accept_score_soft": "Accept score: SOFT mode",
+        "settings.field.pair_second_best_margin": "Min margin over the runner-up",
+        "settings.field.mixed_timezone_safe_mode": "Safe mode for mixed time zones",
+        "settings.field.store_companions_inside_series": "Keep HEIC/JPEG companions inside the series folder",
+        "settings.field.preserve_source_subfolders": "Preserve the source subfolder structure",
+        "settings.field.duplicate_behavior": "On name collision",
+        "settings.field.output_folder_template": "Output folder name template",
+        "settings.field.preserve_file_times": "Preserve file timestamps",
+        "settings.field.preview_only": "Preview only (copy nothing)",
+        "settings.field.require_plan_before_operation": "Confirm the plan before Copy/Move",
+        "settings.field.verify_sha256": "Verify copies with SHA-256",
+        "settings.field.worker_count": "Metadata reader threads (1–16)",
+        "settings.field.thumbnail_size": "Preview size, px (96–1024)",
+        "settings.field.preview_cache_items": "Preview cache, files",
+        "settings.field.exiftool_batch_size": "Files per ExifTool call",
+        "settings.field.preview_similarity_enabled": "Compare previews during analysis",
+        "settings.field.visual_similarity_threshold": "Visual similarity threshold (0–1)",
+        "settings.field.report_formats": "Report formats (json, csv, txt)",
+        "settings.field.report_language": "Report language",
+        "settings.field.report_detail": "Report detail",
+        "settings.field.csv_english_headers": "English CSV headers",
+        "settings.field.privacy_redact_absolute_paths": "Redact absolute paths in reports",
+        "settings.field.exiftool_path": "Path to exiftool.exe (empty = bundled)",
+        "settings.field.log_level": "Log level",
         "path.source": "Source folder",
         "path.output": "Output folder",
         "path.browse": "Browse",
@@ -663,11 +839,53 @@ class I18n:
         return self.gettext(f"type.{value}")
 
 
+#: Windows primary language identifier for Russian (LANGID & 0x3FF).
+_LANG_RUSSIAN = 0x19
+
+
 def detect_default_language() -> str:
-    lang, _encoding = locale.getdefaultlocale()
-    if lang and lang.lower().startswith("ru"):
-        return "ru"
+    """Pick the first-run UI language from the operating system.
+
+    On Windows the user's display language is the authoritative signal
+    (``LANG``/``LANGUAGE`` are normally unset there, which is why the old
+    environment-variable check always answered "en"). Elsewhere, and as a
+    fallback, the process locale and the usual environment variables are used.
+    """
+    ui_language = _windows_ui_language_id()
+    if ui_language is not None:
+        return "ru" if ui_language & 0x3FF == _LANG_RUSSIAN else "en"
+    for candidate in _locale_candidates():
+        text = candidate.lower()
+        if text.startswith("ru") or "_ru" in text or "russian" in text:
+            return "ru"
     return "en"
+
+
+def _windows_ui_language_id() -> int | None:
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+
+        value = int(ctypes.windll.kernel32.GetUserDefaultUILanguage())
+        return value or None
+    except Exception:
+        return None
+
+
+def _locale_candidates() -> list[str]:
+    found: list[str] = []
+    try:
+        language, _encoding = locale.getlocale()
+        if language:
+            found.append(language)
+    except Exception:
+        pass
+    for variable in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):
+        value = os.environ.get(variable)
+        if value:
+            found.append(value)
+    return found
 
 
 def available_languages() -> tuple[str, ...]:
